@@ -1,0 +1,554 @@
+import React, { useState } from "react";
+import { loginUser, registerUser } from "../services/api";
+
+function AuthPage({ onLogin }) {
+  const [mode, setMode] = useState("login");
+
+  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [success, setSuccess] = useState("");
+
+  const switchMode = (nextMode) => {
+    setMode(nextMode);
+    setError("");
+    setSuccess("");
+    setPassword("");
+    setConfirmPassword("");
+  };
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+
+    setError("");
+    setSuccess("");
+
+    if (!email.trim()) {
+      setError("Please enter your email address.");
+      return;
+    }
+
+    if (!password) {
+      setError("Please enter your password.");
+      return;
+    }
+
+    if (mode === "register") {
+      if (!username.trim()) {
+        setError("Please enter a username.");
+        return;
+      }
+
+      if (password.length < 6) {
+        setError("Password must be at least 6 characters.");
+        return;
+      }
+
+      if (password !== confirmPassword) {
+        setError("Passwords do not match.");
+        return;
+      }
+    }
+
+    try {
+      setLoading(true);
+
+      if (mode === "register") {
+        await registerUser(
+          username.trim(),
+          email.trim(),
+          password
+        );
+
+        setSuccess(
+          "Account created successfully. You can now log in."
+        );
+
+        setMode("login");
+        setPassword("");
+        setConfirmPassword("");
+
+        return;
+      }
+
+      const data = await loginUser(
+        email.trim(),
+        password
+      );
+
+      /*
+       * Backend normally returns:
+       * {
+       *   access_token: "...",
+       *   token_type: "bearer",
+       *   user: {...}
+       * }
+       *
+       * We support the common token field names so
+       * the frontend remains compatible.
+       */
+
+      const token =
+        data.access_token ||
+        data.token ||
+        data.jwt;
+
+      if (!token) {
+        throw new Error(
+          "Login succeeded but no authentication token was returned."
+        );
+      }
+
+      localStorage.setItem(
+        "aura_token",
+        token
+      );
+
+      if (data.user) {
+        localStorage.setItem(
+          "aura_user",
+          JSON.stringify(data.user)
+        );
+      } else {
+        localStorage.setItem(
+          "aura_user",
+          JSON.stringify({
+            email: email.trim()
+          })
+        );
+      }
+
+      setPassword("");
+      setConfirmPassword("");
+      setSuccess("");
+
+      if (typeof onLogin === "function") {
+        onLogin(data);
+      }
+
+    } catch (err) {
+      console.error(
+        "AUTHENTICATION ERROR:",
+        err
+      );
+
+      setError(
+        err?.message ||
+          "Authentication failed. Please try again."
+      );
+
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="auth-page">
+
+      <style>{`
+        .auth-page {
+          width: 100%;
+          min-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 24px;
+          box-sizing: border-box;
+          background: #f7f7f8;
+          font-family:
+            Inter,
+            -apple-system,
+            BlinkMacSystemFont,
+            "Segoe UI",
+            sans-serif;
+        }
+
+        .auth-card {
+          width: min(430px, 100%);
+          background: #ffffff;
+          border: 1px solid #e5e5e7;
+          border-radius: 18px;
+          padding: 34px;
+          box-sizing: border-box;
+          box-shadow:
+            0 12px 40px rgba(0, 0, 0, 0.07);
+        }
+
+        .auth-logo {
+          width: 52px;
+          height: 52px;
+          margin: 0 auto 18px;
+          border-radius: 14px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: #111111;
+          color: #ffffff;
+          font-size: 25px;
+          font-weight: 700;
+        }
+
+        .auth-title {
+          margin: 0;
+          text-align: center;
+          font-size: 28px;
+          line-height: 1.2;
+          font-weight: 700;
+          color: #171717;
+        }
+
+        .auth-subtitle {
+          margin: 8px 0 28px;
+          text-align: center;
+          color: #6b6d73;
+          font-size: 14px;
+          line-height: 1.5;
+        }
+
+        .auth-tabs {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 4px;
+          padding: 4px;
+          margin-bottom: 24px;
+          background: #f0f0f2;
+          border-radius: 10px;
+        }
+
+        .auth-tab {
+          border: 0;
+          border-radius: 8px;
+          padding: 10px;
+          background: transparent;
+          color: #6b6d73;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+
+        .auth-tab.active {
+          background: #ffffff;
+          color: #171717;
+          box-shadow:
+            0 1px 4px rgba(0, 0, 0, 0.08);
+        }
+
+        .auth-form {
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+        }
+
+        .auth-field {
+          display: flex;
+          flex-direction: column;
+          gap: 7px;
+        }
+
+        .auth-label {
+          font-size: 13px;
+          font-weight: 600;
+          color: #303136;
+        }
+
+        .auth-input {
+          width: 100%;
+          height: 46px;
+          padding: 0 13px;
+          box-sizing: border-box;
+          border: 1px solid #d9d9dd;
+          border-radius: 9px;
+          outline: none;
+          background: #ffffff;
+          color: #171717;
+          font-size: 14px;
+          transition:
+            border-color 0.15s ease,
+            box-shadow 0.15s ease;
+        }
+
+        .auth-input:focus {
+          border-color: #999ba1;
+          box-shadow:
+            0 0 0 3px rgba(0, 0, 0, 0.05);
+        }
+
+        .auth-input::placeholder {
+          color: #a0a2a8;
+        }
+
+        .auth-button {
+          width: 100%;
+          height: 46px;
+          margin-top: 4px;
+          border: 0;
+          border-radius: 9px;
+          background: #171717;
+          color: #ffffff;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          transition:
+            opacity 0.15s ease,
+            transform 0.15s ease;
+        }
+
+        .auth-button:hover:not(:disabled) {
+          opacity: 0.9;
+        }
+
+        .auth-button:active:not(:disabled) {
+          transform: translateY(1px);
+        }
+
+        .auth-button:disabled {
+          opacity: 0.55;
+          cursor: not-allowed;
+        }
+
+        .auth-error {
+          padding: 11px 12px;
+          border-radius: 8px;
+          background: #fff1f1;
+          border: 1px solid #ffd4d4;
+          color: #b42318;
+          font-size: 13px;
+          line-height: 1.4;
+        }
+
+        .auth-success {
+          padding: 11px 12px;
+          border-radius: 8px;
+          background: #f0faf3;
+          border: 1px solid #ccebd5;
+          color: #18733c;
+          font-size: 13px;
+          line-height: 1.4;
+        }
+
+        .auth-footer {
+          margin-top: 22px;
+          text-align: center;
+          color: #777980;
+          font-size: 12px;
+          line-height: 1.5;
+        }
+
+        @media (max-width: 520px) {
+          .auth-page {
+            padding: 16px;
+          }
+
+          .auth-card {
+            padding: 26px 20px;
+            border-radius: 14px;
+          }
+
+          .auth-title {
+            font-size: 25px;
+          }
+        }
+      `}</style>
+
+      <div className="auth-card">
+
+        <div className="auth-logo">
+          💊
+        </div>
+
+        <h1 className="auth-title">
+          DrugAssist
+        </h1>
+
+        <p className="auth-subtitle">
+          Evidence-first drug intelligence
+        </p>
+
+        <div className="auth-tabs">
+
+          <button
+            type="button"
+            className={
+              mode === "login"
+                ? "auth-tab active"
+                : "auth-tab"
+            }
+            onClick={() =>
+              switchMode("login")
+            }
+          >
+            Login
+          </button>
+
+          <button
+            type="button"
+            className={
+              mode === "register"
+                ? "auth-tab active"
+                : "auth-tab"
+            }
+            onClick={() =>
+              switchMode("register")
+            }
+          >
+            Register
+          </button>
+
+        </div>
+
+        <form
+          className="auth-form"
+          onSubmit={handleSubmit}
+        >
+
+          {mode === "register" && (
+            <div className="auth-field">
+
+              <label
+                className="auth-label"
+                htmlFor="auth-username"
+              >
+                Username
+              </label>
+
+              <input
+                id="auth-username"
+                className="auth-input"
+                type="text"
+                value={username}
+                onChange={(event) =>
+                  setUsername(event.target.value)
+                }
+                placeholder="Enter your username"
+                autoComplete="username"
+                disabled={loading}
+              />
+
+            </div>
+          )}
+
+          <div className="auth-field">
+
+            <label
+              className="auth-label"
+              htmlFor="auth-email"
+            >
+              Email
+            </label>
+
+            <input
+              id="auth-email"
+              className="auth-input"
+              type="email"
+              value={email}
+              onChange={(event) =>
+                setEmail(event.target.value)
+              }
+              placeholder="Enter your email"
+              autoComplete="email"
+              disabled={loading}
+            />
+
+          </div>
+
+          <div className="auth-field">
+
+            <label
+              className="auth-label"
+              htmlFor="auth-password"
+            >
+              Password
+            </label>
+
+            <input
+              id="auth-password"
+              className="auth-input"
+              type="password"
+              value={password}
+              onChange={(event) =>
+                setPassword(event.target.value)
+              }
+              placeholder="Enter your password"
+              autoComplete={
+                mode === "login"
+                  ? "current-password"
+                  : "new-password"
+              }
+              disabled={loading}
+            />
+
+          </div>
+
+          {mode === "register" && (
+            <div className="auth-field">
+
+              <label
+                className="auth-label"
+                htmlFor="auth-confirm-password"
+              >
+                Confirm Password
+              </label>
+
+              <input
+                id="auth-confirm-password"
+                className="auth-input"
+                type="password"
+                value={confirmPassword}
+                onChange={(event) =>
+                  setConfirmPassword(
+                    event.target.value
+                  )
+                }
+                placeholder="Confirm your password"
+                autoComplete="new-password"
+                disabled={loading}
+              />
+
+            </div>
+          )}
+
+          {error && (
+            <div className="auth-error">
+              {error}
+            </div>
+          )}
+
+          {success && (
+            <div className="auth-success">
+              {success}
+            </div>
+          )}
+
+          <button
+            type="submit"
+            className="auth-button"
+            disabled={loading}
+          >
+            {loading
+              ? mode === "login"
+                ? "Logging in..."
+                : "Creating account..."
+              : mode === "login"
+                ? "Login"
+                : "Create account"}
+          </button>
+
+        </form>
+
+        <div className="auth-footer">
+          DrugAssist provides information from
+          loaded drug documents and is not a substitute
+          for professional medical advice.
+        </div>
+
+      </div>
+
+    </div>
+  );
+}
+
+export default AuthPage;
