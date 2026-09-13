@@ -9,3 +9,4 @@ fastembed
 requests
 bcrypt
 PyJWT
+email-validator
