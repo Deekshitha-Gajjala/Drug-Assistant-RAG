@@ -5,11 +5,7 @@ function FeatureCards({ onFeatureSelect }) {
       title: "Web Search",
       description: "Search the web for current information",
     },
-    {
-      id: "youtube",
-      title: "YouTube",
-      description: "Find relevant medical videos",
-    },
+
     {
       id: "pdf",
       title: "Ask a PDF",
