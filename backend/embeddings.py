@@ -10,14 +10,14 @@ MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_DIMENSION = 384
 
 # FastEmbed's default is already 256.
-EMBED_BATCH_SIZE = 256
+EMBED_BATCH_SIZE = 32
 
 # Kept only for backward compatibility with existing imports.
 # We intentionally do NOT use FastEmbed data-parallel workers on
 # Windows because the 2-worker test was slower on this machine.
 INDEX_PARALLEL_WORKERS = None
 
-CPU_THREADS = max(1, min(8, os.cpu_count() or 4))
+CPU_THREADS = max(1, min(2, os.cpu_count() or 2))
 
 print("=" * 60)
 print("Loading embedding model...")
