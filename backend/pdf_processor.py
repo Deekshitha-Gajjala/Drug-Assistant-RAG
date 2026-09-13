@@ -368,6 +368,7 @@ def _looks_like_drug_name(
         "product information",
         "uses",
         "warnings",
+        "warning",
         "directions",
         "other information",
         "inactive ingredients",
@@ -589,6 +590,52 @@ def detect_drug_name(
     ]
 
     # --------------------------------------------------------
+    # Strategy 0:
+    # Look for an explicit branded product name on the first
+    # page. FDA labels commonly contain patterns such as:
+    #
+    #   RINVOQ® (upadacitinib) ...
+    #   RINVOQ/RINVOQ LQ ...
+    #   XARELTO® ...
+    #
+    # This is intentionally checked before generic uppercase
+    # headings such as WARNING, HIGHLIGHTS, etc.
+    # --------------------------------------------------------
+
+    first_page_upper = first_page_text.upper()
+
+    trademark_patterns = [
+        r"\\b([A-Z][A-Z0-9-]{2,40})\\s*[®™]",
+        r"\\b([A-Z][A-Z0-9-]{2,40})\\s*/\\s*[A-Z][A-Z0-9-]{2,40}",
+        r"\\b([A-Z][A-Z0-9-]{2,40})\\s*\\(([A-Z][A-Z0-9-]{2,40})\\)",
+    ]
+
+    explicit_product_candidates = []
+
+    for pattern in trademark_patterns:
+        for match in re.finditer(pattern, first_page_upper):
+            candidate = match.group(1).strip()
+            cleaned = clean_drug_name(candidate)
+
+            if (
+                cleaned
+                and _looks_like_drug_name(cleaned)
+                and _normalize_for_matching(cleaned)
+                not in {
+                    "warning",
+                    "highlights",
+                    "highlights of prescribing information",
+                    "fda",
+                    "usp",
+                }
+            ):
+                if cleaned not in explicit_product_candidates:
+                    explicit_product_candidates.append(cleaned)
+
+    if explicit_product_candidates:
+        return explicit_product_candidates[0]
+
+    # --------------------------------------------------------
     # Strategy 1:
     # Look at first 50 lines for strong candidates.
     # --------------------------------------------------------
@@ -797,6 +844,21 @@ def detect_drug_name(
             frequency.get(cleaned, 0)
             + 1
         )
+
+    # Remove generic section/document headings from the frequency
+    # candidates. These can otherwise outrank the actual drug name.
+    for generic in {
+        "Warning",
+        "Warnings",
+        "Highlights",
+        "Highlights Of Prescribing Information",
+        "Prescribing Information",
+        "Directions",
+        "Uses",
+        "Contraindications",
+        "Adverse Reactions",
+    }:
+        frequency.pop(generic, None)
 
     if frequency:
 

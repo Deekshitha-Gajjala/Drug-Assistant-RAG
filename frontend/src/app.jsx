@@ -63,6 +63,34 @@ function App() {
   const [currentView, setCurrentView] =
     useState("chat");
 
+  // ============================================================
+  // THEME
+  // ============================================================
+  const [isDarkMode, setIsDarkMode] =
+    useState(() => {
+      return (
+        localStorage.getItem("drugassist_theme") ===
+        "dark"
+      );
+    });
+
+  useEffect(() => {
+    localStorage.setItem(
+      "drugassist_theme",
+      isDarkMode ? "dark" : "light"
+    );
+
+    document.body.style.backgroundColor =
+      isDarkMode ? "#111111" : "#ffffff";
+    document.body.style.color =
+      isDarkMode ? "#f5f5f5" : "#171717";
+
+    return () => {
+      document.body.style.backgroundColor = "";
+      document.body.style.color = "";
+    };
+  }, [isDarkMode]);
+
 
   // ============================================================
   // CHAT
@@ -103,10 +131,28 @@ function App() {
     useState([]);
 
   const [selectedDocumentId, setSelectedDocumentId] =
-    useState(null);
+    useState(() => {
+      const stored = localStorage.getItem(
+        "drugassist_selected_document_id"
+      );
+
+      return stored !== null
+        ? Number(stored)
+        : null;
+    });
 
   const [selectedDocumentName, setSelectedDocumentName] =
-    useState("");
+    useState(() => {
+      return (
+        localStorage.getItem(
+          "drugassist_selected_document_name"
+        ) || ""
+      );
+    });
+
+
+  // PDF upload is fast; this tracks the background indexing phase.
+  const [pdfIndexing, setPdfIndexing] = useState(false);
 
 
   // ============================================================
@@ -273,10 +319,22 @@ function App() {
     try {
 
       const data =
-        await getConversations();
+  await getConversations();
 
-      setConversations(
-        data.conversations || []
+const serverChats =
+  Array.isArray(data)
+    ? data
+    : Array.isArray(data?.chats)
+    ? data.chats
+    : Array.isArray(data?.conversations)
+    ? data.conversations
+    : [];
+
+setConversations(serverChats);
+
+      localStorage.setItem(
+        "drugassist_recent_chats",
+        JSON.stringify(serverChats)
       );
 
     } catch (error) {
@@ -285,6 +343,21 @@ function App() {
         "CONVERSATIONS ERROR:",
         error
       );
+
+      try {
+        const cached =
+          JSON.parse(
+            localStorage.getItem(
+              "drugassist_recent_chats"
+            ) || "[]"
+          );
+
+        if (Array.isArray(cached)) {
+          setConversations(cached);
+        }
+      } catch {
+        // Ignore an invalid local cache.
+      }
 
       if (
         error.message?.includes(
@@ -329,25 +402,29 @@ function App() {
       const conversationMessages =
         data.messages || [];
 
-      // Backend returns one database message per record:
-      // { id, role, content, sources, videos, ... }.
-      // Do not convert each record into question/answer pairs;
-      // doing that was the reason old chats appeared empty.
-      const loadedMessages = conversationMessages
-        .filter((item) => item && item.role && item.content !== undefined)
-        .map((item) => ({
-          id: item.id || `message-${Date.now()}-${Math.random()}`,
-          role: item.role,
-          content: item.content,
-          sources: item.sources || [],
-          videos: item.videos || [],
-          attachments: item.attachments || [],
-          evidence: item.evidence || [],
-          confidence: item.confidence,
-          grounding_score: item.grounding_score,
-          mode: item.mode,
-          image_analysis: item.image_analysis
-        }));
+      const loadedMessages =
+        conversationMessages
+          .filter(
+            (item) =>
+              item &&
+              item.role &&
+              item.content !== undefined
+          )
+          .map((item) => ({
+            id:
+              item.id ||
+              `message-${Date.now()}-${Math.random()}`,
+            role: item.role,
+            content: item.content,
+            sources: item.sources || [],
+            videos: item.videos || [],
+            attachments: item.attachments || [],
+            evidence: item.evidence || [],
+            confidence: item.confidence,
+            grounding_score: item.grounding_score,
+            mode: item.mode,
+            image_analysis: item.image_analysis
+          }));
 
       setMessages(
         loadedMessages
@@ -420,20 +497,48 @@ function App() {
         )
       );
 
-      if (selectedDocumentId !== null) {
+      const storedSelectedId =
+        localStorage.getItem(
+          "drugassist_selected_document_id"
+        );
+
+      const preferredId =
+        selectedDocumentId !== null
+          ? selectedDocumentId
+          : storedSelectedId !== null
+          ? Number(storedSelectedId)
+          : null;
+
+      if (preferredId !== null) {
         const selected = documents.find(
           (document) =>
             Number(document.id) ===
-            Number(selectedDocumentId)
+            Number(preferredId)
         );
 
         if (selected) {
+          setSelectedDocumentId(selected.id);
           setSelectedDocumentName(
             selected.filename
+          );
+
+          localStorage.setItem(
+            "drugassist_selected_document_id",
+            String(selected.id)
+          );
+          localStorage.setItem(
+            "drugassist_selected_document_name",
+            selected.filename || ""
           );
         } else {
           setSelectedDocumentId(null);
           setSelectedDocumentName("");
+          localStorage.removeItem(
+            "drugassist_selected_document_id"
+          );
+          localStorage.removeItem(
+            "drugassist_selected_document_name"
+          );
         }
       }
 
@@ -472,6 +577,14 @@ function App() {
       if (Number(selectedDocumentId) === Number(documentId)) {
         setSelectedDocumentId(null);
         setSelectedDocumentName("");
+
+        localStorage.removeItem(
+          "drugassist_selected_document_id"
+        );
+
+        localStorage.removeItem(
+          "drugassist_selected_document_name"
+        );
       }
 
       await loadDocuments();
@@ -511,6 +624,16 @@ function App() {
 
     setSelectedDocumentName(
       selected.filename
+    );
+
+    localStorage.setItem(
+      "drugassist_selected_document_id",
+      String(selected.id)
+    );
+
+    localStorage.setItem(
+      "drugassist_selected_document_name",
+      selected.filename || ""
     );
 
     setInput("");
@@ -641,8 +764,6 @@ function App() {
     setCurrentConversationId(null);
     setMessages([]);
     setInput("");
-    setSelectedDocumentId(null);
-    setSelectedDocumentName("");
     setPendingImage(null);
     setPendingImagePreview("");
     setCurrentView("chat");
@@ -667,48 +788,48 @@ function App() {
   // DELETE CURRENT CHAT
   // ============================================================
 
-  const handleDeleteChat = async () => {
+  const handleDeleteChat = async (chatId) => {
 
-    if (!currentConversationId) {
-      handleNewChat();
-      return;
-    }
+  if (!chatId) {
+    return;
+  }
 
-    try {
+  try {
+    await deleteConversation(chatId);
 
-      await deleteConversation(
-        currentConversationId
-      );
-
-      setConversations(
-        (previous) =>
-          previous.filter(
-            (conversation) =>
-              conversation.id !==
-              currentConversationId
-          )
-      );
-
-      handleNewChat();
-
-    } catch (error) {
-
-      console.error(
-        "DELETE CONVERSATION ERROR:",
-        error
-      );
-
-      if (
-        error.message?.includes(
-          "session has expired"
+    setConversations(
+      (previous) =>
+        previous.filter(
+          (conversation) =>
+            String(conversation.id) !==
+            String(chatId)
         )
-      ) {
-        handleLogout();
-      }
+    );
 
+    if (
+      String(currentConversationId) ===
+      String(chatId)
+    ) {
+      handleNewChat();
     }
 
-  };
+  } catch (error) {
+
+    console.error(
+      "DELETE CONVERSATION ERROR:",
+      error
+    );
+
+    if (
+      error.message?.includes(
+        "session has expired"
+      )
+    ) {
+      handleLogout();
+    }
+  }
+};
+
 
 
   // ============================================================
@@ -756,6 +877,18 @@ function App() {
       return;
     }
 
+    if (pdfIndexing) {
+      setMessages((previous) => [
+        ...previous,
+        {
+          id: `pdf-indexing-${Date.now()}`,
+          role: "assistant",
+          content: "Your PDF is still being indexed. Please wait until indexing is complete, then send your question."
+        }
+      ]);
+      return;
+    }
+
     const token =
       localStorage.getItem("aura_token");
 
@@ -765,10 +898,25 @@ function App() {
     }
 
     const imageToSend = pendingImage;
+    const documentToSend = selectedDocumentId;
+    const documentNameToSend = selectedDocumentName;
+
     const userMessage = {
       id: `user-${Date.now()}`,
       role: "user",
-      content: text
+      content: text,
+      attachments:
+        documentToSend !== null &&
+        documentToSend !== undefined &&
+        documentNameToSend
+          ? [
+              {
+                document_id: documentToSend,
+                filename: documentNameToSend,
+                status: "PDF"
+              }
+            ]
+          : []
     };
 
     setMessages((previous) => [
@@ -779,6 +927,20 @@ function App() {
     setInput("");
     setPendingImage(null);
     setPendingImagePreview("");
+
+    // The selected PDF becomes part of the sent user message.
+    // Clear it from the composer immediately after sending.
+    setSelectedDocumentId(null);
+    setSelectedDocumentName("");
+
+    localStorage.removeItem(
+      "drugassist_selected_document_id"
+    );
+
+    localStorage.removeItem(
+      "drugassist_selected_document_name"
+    );
+
     setLoading(true);
 
     try {
@@ -792,13 +954,54 @@ function App() {
             currentConversationId
           );
 
-        if (data.chat_id || data.conversation_id) {
-          setCurrentConversationId(
-            data.chat_id || data.conversation_id
-          );
-        }
+        const newChatId =
+  data.chat_id || data.conversation_id;
 
-        await loadConversations();
+if (newChatId) {
+  setCurrentConversationId(newChatId);
+
+  setConversations((previous) => {
+    const exists = previous.some(
+      (chat) =>
+        String(chat.id) === String(newChatId)
+    );
+
+    if (exists) {
+      return previous;
+    }
+
+    return [
+      {
+        id: newChatId,
+        title: text.slice(0, 60) || "New chat",
+      },
+      ...previous,
+    ];
+  });
+}
+
+await loadConversations();
+
+        if (newChatId) {
+          setConversations((previous) => {
+            const exists = previous.some(
+              (chat) =>
+                String(chat.id) === String(newChatId)
+            );
+
+            if (exists) {
+              return previous;
+            }
+
+            return [
+              {
+                id: newChatId,
+                title: text.slice(0, 60) || "New chat",
+              },
+              ...previous,
+            ];
+          });
+        }
 
         setMessages((previous) => [
           ...previous,
@@ -819,16 +1022,57 @@ function App() {
           await askAURA(
             text,
             currentConversationId,
-            selectedDocumentId
+            documentToSend
           );
 
-        if (data.chat_id || data.conversation_id) {
-          setCurrentConversationId(
-            data.chat_id || data.conversation_id
-          );
+        const newChatId =
+  data.chat_id || data.conversation_id;
+
+if (newChatId) {
+  setCurrentConversationId(newChatId);
+
+  setConversations((previous) => {
+    const exists = previous.some(
+      (chat) =>
+        String(chat.id) === String(newChatId)
+    );
+
+    if (exists) {
+      return previous;
+    }
+
+    return [
+      {
+        id: newChatId,
+        title: text.slice(0, 60) || "New chat",
+      },
+      ...previous,
+    ];
+  });
+}
+
+await loadConversations();
+
+        if (newChatId) {
+          setConversations((previous) => {
+            const exists = previous.some(
+              (chat) =>
+                String(chat.id) === String(newChatId)
+            );
+
+            if (exists) {
+              return previous;
+            }
+
+            return [
+              {
+                id: newChatId,
+                title: text.slice(0, 60) || "New chat",
+              },
+              ...previous,
+            ];
+          });
         }
-
-        await loadConversations();
 
         setMessages((previous) => [
           ...previous,
@@ -837,7 +1081,16 @@ function App() {
             role: "assistant",
             content:
               data.answer ||
-              "DrugAssist did not return an answer."
+              "DrugAssist did not return an answer.",
+            sources: Array.isArray(data.sources)
+              ? data.sources
+              : [],
+            videos: Array.isArray(data.videos)
+              ? data.videos
+              : [],
+            evidence: Array.isArray(data.evidence)
+              ? data.evidence
+              : [],
           }
         ]);
 
@@ -1038,24 +1291,79 @@ function App() {
         setSelectedDocumentName(
           data.filename || file.name
         );
+
+        localStorage.setItem(
+          "drugassist_selected_document_id",
+          String(data.document_id)
+        );
+
+        localStorage.setItem(
+          "drugassist_selected_document_name",
+          data.filename || file.name
+        );
       }
 
       await loadDocuments();
 
+      const uploadedDocumentId = data.document_id;
 
-      setMessages(
-        (previous) => [
+      if (uploadedDocumentId !== undefined && uploadedDocumentId !== null) {
+        setPdfIndexing(true);
+
+        setMessages((previous) => [
           ...previous,
           {
-            id:
-              `pdf-success-${Date.now()}`,
-            role:
-              "assistant",
-            content:
-              `${file.name} is ready and selected. Type your question below and press Send.`
+            id: `pdf-indexing-${Date.now()}`,
+            role: "assistant",
+            content: `${file.name} uploaded successfully. Preparing the document for questions...`
           }
-        ]
-      );
+        ]);
+
+        let ready = false;
+
+        for (let attempt = 0; attempt < 120; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+
+          const statusResponse = await fetch(
+            `${API_BASE_URL}/documents/${uploadedDocumentId}/index-status`,
+            {
+              method: "GET",
+              headers: {
+                Authorization: `Bearer ${token}`
+              }
+            }
+          );
+
+          if (!statusResponse.ok) {
+            throw new Error("Unable to check PDF indexing status.");
+          }
+
+          const status = await statusResponse.json();
+          console.log("PDF INDEX STATUS:", status);
+
+          if (status.status === "ready") {
+            ready = true;
+            break;
+          }
+
+          if (status.status === "failed") {
+            throw new Error("PDF indexing failed. Please upload the document again.");
+          }
+        }
+
+        if (!ready) {
+          throw new Error("PDF indexing is taking longer than expected. Please wait and try again.");
+        }
+
+        setMessages((previous) => [
+          ...previous,
+          {
+            id: `pdf-ready-${Date.now()}`,
+            role: "assistant",
+            content: `${file.name} is ready and selected. You can now ask questions.`
+          }
+        ]);
+      }
 
 
     } catch (error) {
@@ -1102,6 +1410,7 @@ function App() {
 
     } finally {
 
+      setPdfIndexing(false);
       setLoading(false);
 
     }
@@ -1785,7 +2094,7 @@ function App() {
 
   return (
 
-    <div className="app-shell">
+    <div className={`app-shell ${isDarkMode ? "dark-mode" : ""}`}>
 
       <style>{`
         .chat-area p {
@@ -1946,11 +2255,355 @@ function App() {
           color: #777b84;
         }
 
+
+        /* Final fixes for remaining light elements in dark mode */
+        .app-shell.dark-mode .chat-count {
+          background: #2a2a2a !important;
+          color: #ffffff !important;
+          border: 1px solid #444444 !important;
+        }
+
+        .app-shell.dark-mode .chat-item-icon {
+          background: #252525 !important;
+          color: #eeeeee !important;
+          stroke: #eeeeee !important;
+          border: 1px solid #444444 !important;
+          border-radius: 5px !important;
+        }
+
+        .app-shell.dark-mode .chat-item {
+          background: #171717 !important;
+          color: #eeeeee !important;
+        }
+
+        .app-shell.dark-mode .chat-item-active {
+          background: #292929 !important;
+          color: #ffffff !important;
+        }
+
+        .app-shell.dark-mode .chat-title {
+          color: #eeeeee !important;
+        }
+
+        .app-shell.dark-mode .chat-item-active .chat-title {
+          color: #ffffff !important;
+        }
+
+        .app-shell.dark-mode .chat-delete {
+          color: #aaaaaa !important;
+        }
+
+        .app-shell.dark-mode .chat-delete svg {
+          stroke: #aaaaaa !important;
+        }
+
+        .app-shell.dark-mode .sidebar-user {
+          background: #181818 !important;
+          color: #eeeeee !important;
+          border-color: #303030 !important;
+        }
+
+        .app-shell.dark-mode .user-avatar,
+        .app-shell.dark-mode .user-info,
+        .app-shell.dark-mode .user-name,
+        .app-shell.dark-mode .user-email {
+          color: #eeeeee !important;
+        }
+
+        .app-shell.dark-mode .logout-button {
+          background: #252525 !important;
+          color: #eeeeee !important;
+          border-color: #3b3b3b !important;
+        }
+
+        .app-shell.dark-mode .logout-button svg {
+          stroke: #eeeeee !important;
+        }
+
         @media (max-width: 900px) {
           .chat-area {
             padding-left: 20px !important;
             padding-right: 20px !important;
           }
+        }
+
+        /* ======================================================
+           DRUGASSIST DARK MODE
+           Applied from App.jsx without changing the existing UI.
+        ====================================================== */
+
+        .app-shell.dark-mode {
+          background: #111111 !important;
+          color: #f5f5f5 !important;
+          color-scheme: dark;
+        }
+
+        .app-shell.dark-mode .main-shell,
+        .app-shell.dark-mode .topbar,
+        .app-shell.dark-mode .chat-area,
+        .app-shell.dark-mode .welcome-screen {
+          background: #111111 !important;
+          color: #f5f5f5 !important;
+        }
+
+        .app-shell.dark-mode .theme-button {
+          background: #242424 !important;
+          color: #f5f5f5 !important;
+          border-color: #3a3a3a !important;
+        }
+
+        .app-shell.dark-mode .drugassist-empty-title,
+        .app-shell.dark-mode .welcome-screen h2 {
+          color: #f5f5f5 !important;
+        }
+
+        .app-shell.dark-mode .drugassist-empty-subtitle,
+        .app-shell.dark-mode .welcome-screen p {
+          color: #a9a9a9 !important;
+        }
+
+        /* Sidebar */
+        .app-shell.dark-mode .sidebar,
+        .app-shell.dark-mode .sidebar-header,
+        .app-shell.dark-mode .sidebar-action-area,
+        .app-shell.dark-mode .sidebar-content,
+        .app-shell.dark-mode .sidebar-footer {
+          background: #181818 !important;
+          color: #f5f5f5 !important;
+          border-color: #303030 !important;
+        }
+
+        .app-shell.dark-mode .brand-name,
+        .app-shell.dark-mode .brand-subtitle,
+        .app-shell.dark-mode .sidebar,
+        .app-shell.dark-mode .sidebar label {
+          color: #f5f5f5 !important;
+        }
+
+        .app-shell.dark-mode .brand-subtitle {
+          color: #9d9d9d !important;
+        }
+
+        .app-shell.dark-mode .new-chat-button,
+        .app-shell.dark-mode .sidebar-close,
+        .app-shell.dark-mode .library-button,
+        .app-shell.dark-mode .logout-button {
+          background: #222222 !important;
+          color: #f5f5f5 !important;
+          border-color: #363636 !important;
+        }
+
+        .app-shell.dark-mode .search-input,
+        .app-shell.dark-mode input,
+        .app-shell.dark-mode textarea {
+          background: #1e1e1e !important;
+          color: #f5f5f5 !important;
+          border-color: #383838 !important;
+        }
+
+        .app-shell.dark-mode input::placeholder,
+        .app-shell.dark-mode textarea::placeholder {
+          color: #8e8e8e !important;
+        }
+
+        .app-shell.dark-mode .chat-item,
+        .app-shell.dark-mode .conversation-item {
+          color: #e8e8e8 !important;
+          border-color: #303030 !important;
+        }
+
+        .app-shell.dark-mode .chat-item:hover,
+        .app-shell.dark-mode .conversation-item:hover {
+          background: #242424 !important;
+        }
+
+        /* Recent count badge */
+        .app-shell.dark-mode .chat-count {
+          background: #2a2a2a !important;
+          color: #f5f5f5 !important;
+          border: 1px solid #3d3d3d !important;
+        }
+
+        /* Recent chat icon */
+        .app-shell.dark-mode .chat-item-icon {
+          background: #2a2a2a !important;
+          color: #eeeeee !important;
+          stroke: #eeeeee !important;
+          border-color: #4a4a4a !important;
+        }
+
+        .app-shell.dark-mode .chat-item-icon svg {
+          color: #eeeeee !important;
+          stroke: #eeeeee !important;
+        }
+
+        .app-shell.dark-mode .chat-item .chat-title {
+          color: #eeeeee !important;
+        }
+
+        .app-shell.dark-mode .chat-item .chat-delete {
+          color: #bdbdbd !important;
+        }
+
+        .app-shell.dark-mode .chat-item .chat-delete svg {
+          color: #bdbdbd !important;
+          stroke: #bdbdbd !important;
+        }
+
+        /* Navigation icons and text */
+        .app-shell.dark-mode .sidebar-navigation,
+        .app-shell.dark-mode .sidebar-navigation button,
+        .app-shell.dark-mode .sidebar-navigation svg {
+          color: #eeeeee !important;
+          stroke: #eeeeee !important;
+        }
+
+        /* Chat messages */
+        .app-shell.dark-mode .message-body,
+        .app-shell.dark-mode .message-role,
+        .app-shell.dark-mode .answer-content,
+        .app-shell.dark-mode .answer-content p,
+        .app-shell.dark-mode .answer-content li,
+        .app-shell.dark-mode .answer-content h2,
+        .app-shell.dark-mode .answer-content h3,
+        .app-shell.dark-mode .answer-content h4 {
+          color: #eeeeee !important;
+        }
+
+        .app-shell.dark-mode .message-row-user {
+          color: #ffffff !important;
+        }
+
+        .app-shell.dark-mode .message-avatar {
+          background: #242424 !important;
+          color: #f5f5f5 !important;
+          border-color: #383838 !important;
+        }
+
+        .app-shell.dark-mode .processed-attachment,
+        .app-shell.dark-mode .aura-selected-document {
+          background: #1d1d1d !important;
+          color: #eeeeee !important;
+          border-color: #363636 !important;
+        }
+
+        /* Composer */
+        .app-shell.dark-mode .composer-box {
+          background: #1c1c1c !important;
+          border-color: #383838 !important;
+          box-shadow: 0 8px 28px rgba(0,0,0,0.35) !important;
+        }
+
+        .app-shell.dark-mode .composer-attachment-preview {
+          background: #292929 !important;
+          color: #dddddd !important;
+        }
+
+        .app-shell.dark-mode .composer-attachment-info strong {
+          color: #eeeeee !important;
+        }
+
+        .app-shell.dark-mode .composer-attachment-info span {
+          color: #9d9d9d !important;
+        }
+
+        .app-shell.dark-mode .composer-icon-button,
+        .app-shell.dark-mode .composer-send-button,
+        .app-shell.dark-mode .composer-remove {
+          color: #eeeeee !important;
+        }
+
+        /* Remaining light surfaces */
+        .app-shell.dark-mode .sidebar-user {
+          background: #181818 !important;
+          color: #f5f5f5 !important;
+          border-color: #303030 !important;
+        }
+
+        .app-shell.dark-mode .sidebar-user *,
+        .app-shell.dark-mode .user-info,
+        .app-shell.dark-mode .user-name,
+        .app-shell.dark-mode .user-email,
+        .app-shell.dark-mode .user-avatar {
+          color: #f0f0f0 !important;
+        }
+
+        .app-shell.dark-mode .user-email {
+          color: #9d9d9d !important;
+        }
+
+        .app-shell.dark-mode .user-avatar {
+          background: #242424 !important;
+          border-color: #383838 !important;
+        }
+
+        .app-shell.dark-mode .logout-button {
+          background: #242424 !important;
+          color: #f5f5f5 !important;
+          border-color: #3a3a3a !important;
+        }
+
+        .app-shell.dark-mode .sidebar-library-card {
+          background: #181818 !important;
+          color: #f0f0f0 !important;
+          border-color: #363636 !important;
+        }
+
+        .app-shell.dark-mode .sidebar-library-card * {
+          color: #f0f0f0 !important;
+        }
+
+        .app-shell.dark-mode .library-card-text {
+          color: #a8a8a8 !important;
+        }
+
+        .app-shell.dark-mode .library-card-button {
+          background: transparent !important;
+          color: #f0f0f0 !important;
+        }
+
+        .app-shell.dark-mode .composer-send-button {
+          background: #2b2b2b !important;
+          color: #f0f0f0 !important;
+          border-color: #404040 !important;
+        }
+
+        .app-shell.dark-mode button {
+          color: inherit;
+        }
+
+        /* Remaining sidebar surfaces/elements */
+        .app-shell.dark-mode .recent-section,
+        .app-shell.dark-mode .section-heading,
+        .app-shell.dark-mode .chat-list,
+        .app-shell.dark-mode .empty-chats {
+          color: #eeeeee !important;
+        }
+
+        .app-shell.dark-mode .section-heading span {
+          color: #eeeeee !important;
+        }
+
+        .app-shell.dark-mode .empty-chats svg {
+          color: #bdbdbd !important;
+          stroke: #bdbdbd !important;
+        }
+
+        /* Library */
+        .app-shell.dark-mode [class*="library"],
+        .app-shell.dark-mode [class*="document-card"],
+        .app-shell.dark-mode [class*="document-item"] {
+          color: #eeeeee !important;
+          border-color: #363636 !important;
+        }
+
+        .app-shell.dark-mode [class*="library"] {
+          background-color: #111111 !important;
+        }
+
+        .app-shell.dark-mode [class*="document-card"],
+        .app-shell.dark-mode [class*="document-item"] {
+          background-color: #1c1c1c !important;
         }
       `}</style>
 
@@ -2011,10 +2664,25 @@ function App() {
           <div className="topbar-actions">
 
             <button
+              type="button"
               className="theme-button"
-              title="Change theme"
+              title={
+                isDarkMode
+                  ? "Switch to light mode"
+                  : "Switch to dark mode"
+              }
+              aria-label={
+                isDarkMode
+                  ? "Switch to light mode"
+                  : "Switch to dark mode"
+              }
+              onClick={() =>
+                setIsDarkMode(
+                  (previous) => !previous
+                )
+              }
             >
-              ◐
+              {isDarkMode ? "☀" : "◐"}
             </button>
 
           </div>
@@ -2074,6 +2742,8 @@ function App() {
               <ChatWindow
                 messages={messages}
                 loading={loading}
+                selectedDocumentId={selectedDocumentId}
+                selectedDocumentName={selectedDocumentName}
               />
             )}
 
@@ -2123,34 +2793,6 @@ function App() {
             SELECTED PDF
         ==================================================== */}
 
-        {currentView === "chat" && selectedDocumentId !== null && (
-          <div
-            className="aura-selected-document"
-            title="The next question will be answered using this PDF."
-          >
-            <span className="aura-selected-document-dot">
-              ●
-            </span>
-
-            <span className="aura-selected-document-text">
-              <strong>Using PDF:</strong>{" "}
-              {selectedDocumentName || "Selected document"}
-            </span>
-
-            <button
-              type="button"
-              className="aura-clear-document"
-              onClick={() => {
-                setSelectedDocumentId(null);
-                setSelectedDocumentName("");
-              }}
-              title="Stop using this PDF"
-            >
-              ×
-            </button>
-          </div>
-        )}
-
         {/* ====================================================
             CHAT INPUT
         ==================================================== */}
@@ -2189,6 +2831,25 @@ function App() {
           onRemoveImage={
             removePendingImage
           }
+
+          selectedDocumentName={
+            selectedDocumentId !== null
+              ? selectedDocumentName
+              : ""
+          }
+
+          onClearSelectedDocument={() => {
+            setSelectedDocumentId(null);
+            setSelectedDocumentName("");
+
+            localStorage.removeItem(
+              "drugassist_selected_document_id"
+            );
+
+            localStorage.removeItem(
+              "drugassist_selected_document_name"
+            );
+          }}
 
             loading={
               loading

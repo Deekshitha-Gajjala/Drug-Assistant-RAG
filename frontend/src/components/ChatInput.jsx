@@ -4,13 +4,10 @@ import {
   useState
 } from "react";
 
-import { createPortal } from "react-dom";
-
 import {
   Plus,
   Paperclip,
   Image as ImageIcon,
-  Mic,
   ArrowUp,
   X
 } from "lucide-react";
@@ -116,10 +113,6 @@ function ChatInput({
   // ============================================================
 
   const toggleAttachmentMenu = () => {
-
-    if (loading) {
-      return;
-    }
 
     setAttachmentMenuOpen(
       (previous) => !previous
@@ -343,78 +336,25 @@ function ChatInput({
   // ATTACHMENT MENU
   // ============================================================
 
-  const attachmentMenu = attachmentMenuOpen
-    ? createPortal(
-
-        <div
-          ref={menuRef}
-          className="drugassist-attachment-menu"
-          style={{
-            position: "fixed",
-            left: `${menuPosition.left}px`,
-            bottom: `${menuPosition.bottom}px`
-          }}
-        >
-
-          <button
-            type="button"
-            onClick={() => {
-
-              setAttachmentMenuOpen(false);
-
-              setTimeout(() => {
-
-                pdfInputRef.current?.click();
-
-              }, 0);
-
-            }}
-          >
-
-            <Paperclip
-              size={18}
-              strokeWidth={1.9}
-            />
-
-            <span>
-              Attach PDF
-            </span>
-
-          </button>
-
-
-          <button
-            type="button"
-            onClick={() => {
-
-              setAttachmentMenuOpen(false);
-
-              setTimeout(() => {
-
-                imageInputRef.current?.click();
-
-              }, 0);
-
-            }}
-          >
-
-            <ImageIcon
-              size={18}
-              strokeWidth={1.9}
-            />
-
-            <span>
-              Add image
-            </span>
-
-          </button>
-
-        </div>,
-
-        document.body
-
-      )
-    : null;
+  const attachmentMenu = attachmentMenuOpen ? (
+    <div
+      ref={menuRef}
+      className="drugassist-attachment-menu"
+    >
+      <button
+        type="button"
+        onClick={() => {
+          setAttachmentMenuOpen(false);
+          requestAnimationFrame(() => {
+            pdfInputRef.current?.click();
+          });
+        }}
+      >
+        <Paperclip size={18} strokeWidth={1.9} />
+        <span>Attach PDF</span>
+      </button>
+    </div>
+  ) : null;
 
 
   // ============================================================
@@ -654,7 +594,14 @@ function ChatInput({
            chat scrolling container or transformed composer.
         ====================================================== */
 
+        .composer-box {
+          position: relative;
+        }
+
         .drugassist-attachment-menu {
+          position: absolute;
+          left: 4px;
+          bottom: 58px;
           width: 190px;
           box-sizing: border-box;
           background: #ffffff;
@@ -665,6 +612,7 @@ function ChatInput({
             0 2px 8px rgba(0,0,0,0.06);
           padding: 6px;
           z-index: 2147483647;
+          pointer-events: auto;
           animation: drugassistAttachmentMenuIn 0.12s ease-out;
         }
 
@@ -767,6 +715,8 @@ function ChatInput({
       ======================================================== */}
 
       <div className="composer-shell">
+
+        {attachmentMenu}
 
 
         {/* ======================================================
@@ -897,9 +847,9 @@ function ChatInput({
               type="button"
               className="composer-icon-button"
               onClick={toggleAttachmentMenu}
-              disabled={loading}
-              title="Attach PDF or image"
-              aria-label="Attach PDF or image"
+              disabled={false}
+              title="Attach PDF"
+              aria-label="Attach PDF"
               aria-expanded={
                 attachmentMenuOpen
               }
@@ -920,31 +870,6 @@ function ChatInput({
             <div className="composer-toolbar-spacer" />
 
 
-            {/* ==================================================
-                VOICE
-            ================================================== */}
-
-            <button
-              type="button"
-              className={
-                `composer-icon-button voice-button ${
-                  loading
-                    ? "disabled"
-                    : ""
-                }`
-              }
-              onClick={onVoice}
-              disabled={loading}
-              title="Voice input"
-              aria-label="Voice input"
-            >
-
-              <Mic
-                size={22}
-                strokeWidth={1.9}
-              />
-
-            </button>
 
 
             {/* ==================================================
@@ -997,7 +922,6 @@ function ChatInput({
           PORTAL ATTACHMENT MENU
       ======================================================== */}
 
-      {attachmentMenu}
 
     </>
   );

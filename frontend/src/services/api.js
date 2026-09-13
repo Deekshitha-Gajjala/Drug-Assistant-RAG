@@ -6,7 +6,10 @@ const API_BASE_URL =
 // =========================================================
 
 function getToken() {
-  return localStorage.getItem("token");
+  return (
+    localStorage.getItem("token") ||
+    localStorage.getItem("aura_token")
+  );
 }
 
 function authHeaders(extra = {}) {
@@ -564,6 +567,55 @@ export async function askQuestion(
 }
 
 // =========================================================
+// OPEN / VIEW PDF
+// =========================================================
+
+export async function getDocumentPDF(documentId) {
+  if (
+    documentId === null ||
+    documentId === undefined
+  ) {
+    throw new Error(
+      "Document ID is required."
+    );
+  }
+
+  const response = await fetch(
+    `${API_BASE_URL}/documents/${documentId}/pdf`,
+    {
+      method: "GET",
+      headers: authHeaders(),
+    }
+  );
+
+  if (response.status === 401) {
+    localStorage.removeItem("token");
+    localStorage.removeItem("aura_token");
+  }
+
+  if (!response.ok) {
+    let detail =
+      `Unable to open PDF (status ${response.status})`;
+
+    try {
+      const data = await response.json();
+
+      detail =
+        data?.detail ||
+        data?.message ||
+        data?.error ||
+        detail;
+    } catch {
+      // Keep default error message
+    }
+
+    throw new Error(detail);
+  }
+
+  return response.blob();
+}
+
+// =========================================================
 // HEALTH CHECK
 // =========================================================
 
@@ -611,6 +663,9 @@ export default {
   askWithVoice,
   voiceAsk,
   askQuestion,
+
+  // PDF Viewer
+  getDocumentPDF,
 
   // Health
   healthCheck,

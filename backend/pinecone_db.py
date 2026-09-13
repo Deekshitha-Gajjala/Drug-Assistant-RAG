@@ -1,11 +1,15 @@
 import os
 import hashlib
+import time
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from pinecone import Pinecone
 
-from embeddings import generate_embeddings
+from embeddings import (
+    generate_embeddings,
+    INDEX_PARALLEL_WORKERS,
+)
 from pdf_processor import process_pdf
 
 
@@ -42,7 +46,7 @@ TOP_K = int(
 )
 
 BATCH_SIZE = int(
-    os.getenv("PINECONE_BATCH_SIZE", "50")
+    os.getenv("PINECONE_BATCH_SIZE", "100")
 )
 
 
@@ -345,8 +349,20 @@ def upload_chunks(
         "Generating embeddings..."
     )
 
+    embedding_start = time.perf_counter()
+
     embeddings = generate_embeddings(
-        texts
+        texts,
+        parallel=INDEX_PARALLEL_WORKERS,
+    )
+
+    embedding_seconds = time.perf_counter() - embedding_start
+
+    print(
+        f"Embedding generation time: {embedding_seconds:.2f} seconds"
+    )
+    print(
+        f"FastEmbed parallel workers: {INDEX_PARALLEL_WORKERS}"
     )
 
     if embeddings is None:
@@ -466,6 +482,7 @@ def upload_chunks(
         f"Uploading {len(records)} vectors..."
     )
 
+    upload_start = time.perf_counter()
     total_uploaded = 0
 
     for start in range(
@@ -493,9 +510,14 @@ def upload_chunks(
             f"{len(records)}"
         )
 
+    upload_seconds = time.perf_counter() - upload_start
+
     print()
     print(
         "All vectors uploaded successfully."
+    )
+    print(
+        f"Pinecone upload time: {upload_seconds:.2f} seconds"
     )
 
     return total_uploaded

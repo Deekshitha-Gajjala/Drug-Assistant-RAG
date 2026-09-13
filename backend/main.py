@@ -1,11 +1,33 @@
+# ============================================================
+# DRUGASSIST BACKEND
+# ============================================================
+#
+# FastAPI backend for:
+#   - Authentication
+#   - Chat history
+#   - PDF Library
+#   - PDF upload and indexing
+#   - Image upload and analysis
+#   - Document-specific RAG
+#
+# IMPORTANT:
+#   - No long-term user memory
+#   - No YouTube integration
+#   - Uploaded documents are evidence/data, not instructions
+#   - Chat history is preserved per user
+# ============================================================
+
 import os
 import shutil
+import hashlib
 import uuid
 import traceback
 import json
+import re
 
 from fastapi import (
     FastAPI,
+    BackgroundTasks,
     HTTPException,
     UploadFile,
     File,
@@ -13,8 +35,8 @@ from fastapi import (
     Form,
 )
 
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-
 from pydantic import BaseModel, EmailStr
 
 from rag import (
@@ -22,7 +44,13 @@ from rag import (
     analyze_uploaded_image,
 )
 
-from pinecone_db import index_pdf
+from pinecone_db import (
+    index_pdf,
+    process_pdf,
+    create_document_id,
+    delete_document as delete_pinecone_document,
+    upload_chunks,
+)
 
 from database.database import (
     init_database,
@@ -40,10 +68,7 @@ from database.database import (
     create_document,
     get_user_documents,
     delete_document,
-    get_user_memories,
-    upsert_memory,
 )
-
 
 from auth import (
     hash_password,
@@ -60,7 +85,7 @@ from auth import (
 app = FastAPI(
     title="DrugAssist API",
     description="Evidence-first Drug Information RAG Chatbot",
-    version="4.0.0",
+    version="5.0.0",
 )
 
 
@@ -120,6 +145,12 @@ os.makedirs(
 
 
 # ============================================================
+# PDF INDEXING STATUS
+# ============================================================
+PDF_INDEX_STATUS = {}
+
+
+# ============================================================
 # ALLOWED IMAGE TYPES
 # ============================================================
 
@@ -137,14 +168,123 @@ ALLOWED_IMAGE_EXTENSIONS = {
 
 
 # ============================================================
+# TRUSTED MEDICAL SOURCE REGISTRY
+# ============================================================
+#
+# DrugAssist does NOT trust an uploaded PDF merely because:
+#   - the filename looks official,
+#   - it contains medical terminology, or
+#   - it claims to be a prescribing-information document.
+#
+# A PDF must match an approved document fingerprint before it
+# can enter the medical RAG index.
+#
+# This first registry entry is the exact RINVOQ PDF currently
+# supplied for this project. Its contents match the official
+# RINVOQ prescribing information published by AbbVie and the
+# official FDA labeling ecosystem.
+#
+# To add another approved drug document later, add its exact
+# SHA-256 fingerprint here after independently verifying the
+# source. Do NOT add arbitrary user-uploaded hashes.
+#
+TRUSTED_PDF_REGISTRY = {
+    "rinvoq_pi.pdf": {
+        "sha256": "9f0524388a03e816a19d05845b3a4dce5d6e8b8ba54755480bc1d8ddf2f9d300",
+        "drug_terms": (
+            "rinvoq",
+            "upadacitinib",
+        ),
+        "source": "Official RINVOQ Prescribing Information (AbbVie/FDA labeling)",
+        "official_url": "https://www.rxabbvie.com/pdf/rinvoq_pi.pdf",
+    },
+}
+
+
+def _sha256_file(file_path):
+    """Return the SHA-256 fingerprint of a PDF."""
+    digest = hashlib.sha256()
+
+    with open(file_path, "rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+
+    return digest.hexdigest()
+
+
+def verify_trusted_pdf(
+    file_path,
+    original_filename,
+    processed=None,
+):
+    """
+    Strict source-of-truth gate for medical PDFs.
+
+    A PDF is trusted only when its exact SHA-256 fingerprint is
+    present in TRUSTED_PDF_REGISTRY and its extracted drug
+    identity is consistent with that registry entry.
+
+    This deliberately rejects unknown/fake/self-authored PDFs
+    instead of silently indexing them into the medical RAG.
+    """
+    file_hash = _sha256_file(file_path)
+    filename_key = os.path.basename(original_filename).lower()
+
+    matched_profile = None
+    matched_profile_name = None
+
+    for profile_name, profile in TRUSTED_PDF_REGISTRY.items():
+        if file_hash == profile.get("sha256", "").lower():
+            matched_profile = profile
+            matched_profile_name = profile_name
+            break
+
+    if matched_profile is None:
+        raise ValueError(
+            "PDF rejected: this document is not in DrugAssist's "
+            "approved medical-source registry. Only independently "
+            "verified medical documents can be used as evidence."
+        )
+
+    if processed and matched_profile.get("drug_terms"):
+        extracted_text = " ".join(
+            str(
+                processed.get(key, "")
+            )
+            for key in ("drug", "source")
+        ).lower()
+
+        if not any(
+            term.lower() in extracted_text
+            for term in matched_profile["drug_terms"]
+        ):
+            raise ValueError(
+                "PDF rejected: the document identity does not match "
+                "the approved source record."
+            )
+
+    print()
+    print("TRUSTED SOURCE VERIFICATION: PASSED")
+    print("REGISTERED DOCUMENT:", matched_profile_name)
+    print("SOURCE:", matched_profile["source"])
+    print("SHA256:", file_hash)
+
+    return {
+        "trusted": True,
+        "source": matched_profile["source"],
+        "official_url": matched_profile["official_url"],
+        "sha256": file_hash,
+        "registry_name": matched_profile_name,
+    }
+
+
+# ============================================================
 # STARTUP
 # ============================================================
 
 @app.on_event("startup")
 def startup_event():
 
-    # Initialize SQLite database and create
-    # all required tables if they do not exist.
     init_database()
 
     print()
@@ -156,7 +296,10 @@ def startup_event():
     print("RAG engine loaded.")
     print("PDF upload enabled.")
     print("Image analysis enabled.")
+    print("Long-term memory disabled.")
+    print("YouTube integration disabled.")
     print("=" * 70)
+
 
 # ============================================================
 # REQUEST MODELS
@@ -195,7 +338,7 @@ def health():
     return {
         "status": "healthy",
         "message": "DrugAssist API is running",
-        "version": "4.0.0",
+        "version": "5.0.0",
     }
 
 
@@ -210,10 +353,10 @@ def root():
         "name": "DrugAssist",
         "description": (
             "Evidence-first drug information "
-            "assistant with multimodal RAG"
+            "assistant with document-grounded RAG"
         ),
         "status": "running",
-        "version": "4.0.0",
+        "version": "5.0.0",
     }
 
 
@@ -254,10 +397,7 @@ def register(
 
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Password must contain "
-                "at least 6 characters."
-            ),
+            detail="Password must contain at least 6 characters.",
         )
 
     existing_user = get_user_by_email(
@@ -521,9 +661,9 @@ def get_single_chat(
 
     for message in messages:
 
-        # --------------------------------------------
+        # ----------------------------------------------------
         # SOURCES
-        # --------------------------------------------
+        # ----------------------------------------------------
 
         try:
 
@@ -538,26 +678,9 @@ def get_single_chat(
 
             sources = []
 
-        # --------------------------------------------
-        # VIDEOS
-        # --------------------------------------------
-
-        try:
-
-            videos = json.loads(
-                message.get(
-                    "videos_json",
-                    "[]",
-                )
-            )
-
-        except Exception:
-
-            videos = []
-
-        # --------------------------------------------
+        # ----------------------------------------------------
         # ATTACHMENTS
-        # --------------------------------------------
+        # ----------------------------------------------------
 
         try:
 
@@ -572,9 +695,9 @@ def get_single_chat(
 
             attachments = []
 
-        # --------------------------------------------
+        # ----------------------------------------------------
         # EVIDENCE
-        # --------------------------------------------
+        # ----------------------------------------------------
 
         try:
 
@@ -589,13 +712,21 @@ def get_single_chat(
 
             evidence = []
 
+        # ----------------------------------------------------
+        # IMPORTANT
+        # ----------------------------------------------------
+        # YouTube/video results are intentionally ignored.
+        # Existing old videos_json database data will not
+        # be returned to the frontend.
+        # ----------------------------------------------------
+
         formatted_messages.append(
             {
                 "id": message["id"],
                 "role": message["role"],
                 "content": message["content"],
                 "sources": sources,
-                "videos": videos,
+                "videos": [],
                 "attachments": attachments,
                 "evidence": evidence,
                 "confidence": message.get(
@@ -699,6 +830,17 @@ def remove_document(
 # ============================================================
 # BASIC ASK ENDPOINT
 # ============================================================
+#
+# This endpoint does NOT use persistent memory.
+#
+# For normal application use, the frontend should use /chat
+# because /chat supports:
+#   - chat history
+#   - selected PDF
+#   - attachments
+#   - document-specific RAG
+#
+# ============================================================
 
 @app.post("/ask")
 def ask(
@@ -717,16 +859,13 @@ def ask(
 
     try:
 
-        user_memories = get_user_memories(
-            user["id"]
-        )
-
         result = answer_question(
             question,
             conversation_history=[],
-            memories=user_memories,
+            memories=[],
             user_id=user["id"],
             chat_id=None,
+            document_id=None,
         )
 
         if not isinstance(
@@ -750,10 +889,7 @@ def ask(
                 "sources",
                 [],
             ),
-            "videos": result.get(
-                "videos",
-                [],
-            ),
+            "videos": [],
             "confidence": result.get(
                 "confidence",
                 {
@@ -831,7 +967,7 @@ def save_pdf_document(
     )
 
     # --------------------------------------------------------
-    # New database schema
+    # Current database schema
     # --------------------------------------------------------
 
     try:
@@ -854,7 +990,7 @@ def save_pdf_document(
         pass
 
     # --------------------------------------------------------
-    # Older database schema compatibility
+    # Compatibility with older database schema
     # --------------------------------------------------------
 
     try:
@@ -896,10 +1032,6 @@ def save_image_document(
     stored_filename,
 ):
 
-    # --------------------------------------------------------
-    # New database schema
-    # --------------------------------------------------------
-
     try:
 
         return create_document(
@@ -920,10 +1052,6 @@ def save_image_document(
     except TypeError:
 
         pass
-
-    # --------------------------------------------------------
-    # Older database compatibility
-    # --------------------------------------------------------
 
     try:
 
@@ -952,164 +1080,405 @@ def save_image_document(
 
 
 # ============================================================
+# PDF SAFETY VALIDATION
+# ============================================================
+
+def validate_pdf_content(
+    file_path: str,
+):
+    """
+    Basic ingestion safety check.
+
+    A PDF is treated as DATA/EVIDENCE.
+    Text inside the PDF must never be treated as an
+    instruction to the AI.
+
+    This function rejects documents containing obvious
+    prompt-injection instructions before indexing.
+
+    NOTE:
+    This does not prove that a document is medically
+    authoritative. Users should upload trusted sources
+    such as official prescribing information, FDA labels,
+    or other verified medical documents.
+    """
+
+    try:
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(
+            file_path
+        )
+
+        if not reader.pages:
+
+            raise ValueError(
+                "The PDF contains no readable pages."
+            )
+
+        extracted_text = []
+
+        for page in reader.pages:
+
+            try:
+
+                text = page.extract_text()
+
+                if text:
+
+                    extracted_text.append(
+                        text
+                    )
+
+            except Exception:
+
+                continue
+
+        full_text = "\n".join(
+            extracted_text
+        )
+
+        cleaned_text = (
+            full_text
+            .strip()
+        )
+
+        if not cleaned_text:
+
+            raise ValueError(
+                "The PDF contains no readable text. "
+                "Please upload a text-based medical PDF."
+            )
+
+        # ----------------------------------------------------
+        # Obvious prompt-injection patterns
+        # ----------------------------------------------------
+
+        suspicious_patterns = [
+            r"ignore\s+(all\s+)?previous\s+instructions",
+            r"ignore\s+(all\s+)?prior\s+instructions",
+            r"disregard\s+(all\s+)?previous\s+instructions",
+            r"disregard\s+(all\s+)?prior\s+instructions",
+            r"forget\s+(all\s+)?previous\s+instructions",
+            r"system\s+prompt",
+            r"reveal\s+(your\s+)?system\s+prompt",
+            r"show\s+(your\s+)?system\s+prompt",
+            r"print\s+(your\s+)?system\s+prompt",
+            r"reveal\s+your\s+instructions",
+            r"show\s+your\s+instructions",
+            r"developer\s+message",
+            r"api\s*key",
+            r"secret\s+key",
+            r"access\s+token",
+            r"jailbreak",
+            r"you\s+are\s+now\s+",
+            r"act\s+as\s+if\s+",
+        ]
+
+        for pattern in suspicious_patterns:
+
+            if re.search(
+                pattern,
+                cleaned_text,
+                re.IGNORECASE,
+            ):
+
+                raise ValueError(
+                    "This PDF contains suspicious "
+                    "instruction-like content and cannot "
+                    "be used as a DrugAssist evidence source."
+                )
+
+        return {
+            "valid": True,
+            "pages": len(reader.pages),
+            "characters": len(cleaned_text),
+        }
+
+    except ValueError:
+
+        raise
+
+    except Exception as error:
+
+        raise ValueError(
+            "Unable to validate the PDF: "
+            + str(error)
+        )
+
+
+# ============================================================
+# BACKGROUND PDF INDEXING
+# ============================================================
+
+def _finish_pdf_indexing(
+    file_path: str,
+    database_document_id: int,
+    document_id: str,
+    drug: str,
+    source: str,
+    chunks: list,
+):
+    """Finish Pinecone indexing and update readiness status."""
+    PDF_INDEX_STATUS[str(database_document_id)] = {
+        "status": "indexing",
+        "message": "Generating embeddings and indexing document...",
+    }
+
+    try:
+        print()
+        print("=" * 70)
+        print("BACKGROUND PDF INDEXING")
+        print("=" * 70)
+
+        delete_pinecone_document(document_id)
+
+        vector_count = upload_chunks(
+            chunks=chunks,
+            document_id=document_id,
+            drug=drug,
+            source=source,
+        )
+
+        PDF_INDEX_STATUS[str(database_document_id)] = {
+            "status": "ready",
+            "message": "Document indexing complete.",
+            "vector_count": vector_count,
+        }
+
+        print(f"Background indexing complete: {vector_count} vectors.")
+        print("=" * 70)
+
+    except Exception as error:
+        PDF_INDEX_STATUS[str(database_document_id)] = {
+            "status": "failed",
+            "message": "Document indexing failed.",
+        }
+        print()
+        print("BACKGROUND PDF INDEXING ERROR:")
+        print(repr(error))
+        traceback.print_exc()
+        print("=" * 70)
+
+
+# ============================================================
+# PDF INDEXING STATUS
+# ============================================================
+
+@app.get("/documents/{document_id}/index-status")
+def get_pdf_index_status(
+    document_id: int,
+    current_user=Depends(get_current_user),
+):
+    document = get_document(document_id, current_user["id"])
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    status = PDF_INDEX_STATUS.get(
+        str(document_id),
+        {
+            "status": "unknown",
+            "message": "Indexing status is not available in this server session.",
+        },
+    )
+
+    return {"success": True, "document_id": document_id, **status}
+
+
+# ============================================================
 # PDF UPLOAD
 # ============================================================
 
 @app.post("/upload-pdf")
 async def upload_pdf(
     file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
     user=Depends(get_current_user),
 ):
 
     if not file.filename:
-
         raise HTTPException(
             status_code=400,
             detail="No file selected.",
         )
 
-    original_filename = os.path.basename(
-        file.filename
-    )
+    original_filename = os.path.basename(file.filename)
 
-    if not original_filename.lower().endswith(
-        ".pdf"
-    ):
-
+    if not original_filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
             detail="Only PDF files are allowed.",
         )
 
-    stored_filename = (
-        str(uuid.uuid4())
-        + "_"
-        + original_filename
-    )
-
-    file_path = os.path.join(
-        PDF_FOLDER,
-        stored_filename,
-    )
+    stored_filename = str(uuid.uuid4()) + "_" + original_filename
+    file_path = os.path.join(PDF_FOLDER, stored_filename)
 
     try:
-
-        with open(
-            file_path,
-            "wb",
-        ) as buffer:
-
-            shutil.copyfileobj(
-                file.file,
-                buffer,
-            )
+        # ----------------------------------------------------
+        # SAVE PDF
+        # ----------------------------------------------------
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
         print()
         print("=" * 70)
         print("PDF UPLOAD")
         print("=" * 70)
-        print(
-            "USER:",
-            user["email"],
+        print("USER:", user["email"])
+        print("FILENAME:", original_filename)
+
+        # ----------------------------------------------------
+        # SAFETY VALIDATION
+        # ----------------------------------------------------
+        validation = validate_pdf_content(file_path)
+
+        print("PDF VALIDATION: PASSED")
+        print("READABLE PAGES:", validation["pages"])
+
+        # ----------------------------------------------------
+        # EXTRACT + CHUNK ONCE
+        # ----------------------------------------------------
+        # We process the PDF here only far enough to obtain its
+        # metadata/chunks. The expensive embedding + Pinecone
+        # upload is moved to a background task.
+        processed = process_pdf(file_path)
+
+        if not isinstance(processed, dict):
+            processed = {}
+
+        chunks = processed.get("chunks") or []
+        pages = processed.get("pages") or []
+        drug = processed.get("drug") or "Unknown"
+        source = processed.get("source") or original_filename
+
+        # ----------------------------------------------------
+        # TRUSTED MEDICAL SOURCE GATE
+        # ----------------------------------------------------
+        #
+        # Prompt-injection scanning alone is not enough.
+        # A user can create a perfectly readable but fabricated
+        # medical PDF. Such a file must never enter Pinecone.
+        trusted_source = verify_trusted_pdf(
+            file_path=file_path,
+            original_filename=original_filename,
+            processed=processed,
         )
-        print(
-            "FILENAME:",
-            original_filename,
-        )
+
+        # Use the verified source label in Pinecone metadata
+        # instead of trusting arbitrary PDF metadata.
+        source = trusted_source["source"]
+
+        if not chunks:
+            raise ValueError("No readable text chunks were generated from the PDF.")
+
+        pinecone_document_id = create_document_id(file_path)
+
+        upload_result = {
+            "success": True,
+            "drug": drug,
+            "source": source,
+            "trusted_source": True,
+            "trust_status": "verified",
+            "official_source_url": trusted_source["official_url"],
+            "document_sha256": trusted_source["sha256"],
+            "document_id": pinecone_document_id,
+            "pages": len(pages),
+            "chunks": len(chunks),
+        }
 
         # ----------------------------------------------------
-        # INDEX PDF
+        # SAVE LIBRARY RECORD IMMEDIATELY
         # ----------------------------------------------------
-
-        result = index_pdf(
-            file_path
-        )
-
-        if not isinstance(
-            result,
-            dict,
-        ):
-
-            result = {}
-
-        # ----------------------------------------------------
-        # SAVE LIBRARY RECORD
-        # ----------------------------------------------------
-
         document_id = save_pdf_document(
             user["id"],
             original_filename,
             file_path,
             stored_filename,
-            result,
+            upload_result,
         )
 
-        print(
-            "DOCUMENT ID:",
+        # ----------------------------------------------------
+        # INDEX IN BACKGROUND
+        # ----------------------------------------------------
+        # Use the existing Pinecone implementation.
+        if background_tasks is None:
+            raise RuntimeError("Background task manager is unavailable.")
+
+        PDF_INDEX_STATUS[str(document_id)] = {
+            "status": "indexing",
+            "message": "Generating embeddings and indexing document...",
+        }
+
+        background_tasks.add_task(
+            _finish_pdf_indexing,
+            file_path,
             document_id,
+            pinecone_document_id,
+            drug,
+            source,
+            chunks,
         )
+
+        indexing_started = True
+        index_status = "indexing"
+
+        print("DOCUMENT ID:", document_id)
+        print("PDF saved. Pinecone indexing started in background.")
 
         print("=" * 70)
 
         return {
             "success": True,
             "message": (
-                "PDF uploaded and "
-                "indexed successfully."
+                "PDF uploaded successfully. "
+                "Indexing is continuing in the background."
             ),
             "filename": original_filename,
             "stored_filename": stored_filename,
             "document_id": document_id,
-            "drug": result.get(
-                "drug"
-            ),
-            "source": result.get(
-                "source"
-            ),
-            "pages": result.get(
-                "pages"
-            ),
-            "chunks": result.get(
-                "chunks"
-            ),
+            "drug": drug,
+            "source": source,
+            "trusted_source": True,
+            "trust_status": "verified",
+            "official_source_url": trusted_source["official_url"],
+            "pages": len(pages),
+            "chunks": len(chunks),
+            "indexing": indexing_started,
+            "index_status": index_status,
+            "cached": False,
         }
 
-    except Exception as error:
+    except ValueError as error:
+        print("PDF REJECTED BY SAFETY/TRUST GATE:", repr(error))
 
-        print()
-        print("=" * 70)
-        print("PDF UPLOAD ERROR")
-        print("=" * 70)
-        print(
-            repr(error)
-        )
-        traceback.print_exc()
-        print("=" * 70)
-
-        if os.path.exists(
-            file_path
-        ):
-
+        if os.path.exists(file_path):
             try:
-
-                os.remove(
-                    file_path
-                )
-
+                os.remove(file_path)
             except Exception:
+                pass
 
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        )
+
+    except Exception as error:
+        print("PDF UPLOAD ERROR:", repr(error))
+        traceback.print_exc()
+
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
                 pass
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Unable to process PDF: "
-                + str(error)
-            ),
+            detail="Unable to process PDF: " + str(error),
         )
 
     finally:
-
         await file.close()
 
 
@@ -1143,7 +1512,14 @@ def validate_image_file(
 
 
 # ============================================================
-# CONVERSATION IMAGE MEMORY
+# SHORT-TERM IMAGE CONTEXT
+# ============================================================
+#
+# This is NOT long-term user memory.
+#
+# It only recovers the previous image analysis from the
+# current chat so the user can ask a follow-up question.
+#
 # ============================================================
 
 def get_previous_image_context(
@@ -1201,9 +1577,6 @@ def get_previous_image_context(
                     image_seen = True
                     continue
 
-                # A later PDF attachment means the
-                # previous image is no longer active.
-
                 if ".pdf" in attachment_part:
 
                     return ""
@@ -1225,70 +1598,45 @@ def get_previous_image_context(
 
 
 # ============================================================
-# GET PREVIOUS VIDEOS
+# BUILD SHORT-TERM CONVERSATION HISTORY
 # ============================================================
 
-def get_previous_videos(
+def build_conversation_history(
     messages,
+    max_messages=12,
 ):
-
-    previous_videos = []
-
-    if not messages:
-
-        return previous_videos
-
-    for message in messages:
-
-        raw_videos = message.get(
-            "videos_json",
-            "[]",
-        )
-
-        try:
-
-            parsed_videos = json.loads(
-                raw_videos
-            )
-
-            if isinstance(
-                parsed_videos,
-                list,
-            ):
-
-                previous_videos.extend(
-                    parsed_videos
-                )
-
-        except Exception:
-
-            pass
-
-    return previous_videos
-
-
-# ============================================================
-# CONVERSATION MEMORY HELPERS
-# ============================================================
-
-def build_conversation_history(messages, max_messages=12):
-    """Convert stored chat messages into LLM conversation history.
-
-    The current user message is not included here because this helper
-    is called before the new user message is saved.
     """
+    Convert stored chat messages into LLM conversation history.
+
+    This is only the current chat's short-term history.
+
+    It does NOT create or retrieve persistent user memory.
+    """
+
     history = []
 
     if not messages:
+
         return history
 
     for message in messages[-max_messages:]:
-        if not isinstance(message, dict):
+
+        if not isinstance(
+            message,
+            dict,
+        ):
+
             continue
 
-        role = message.get("role")
+        role = message.get(
+            "role"
+        )
 
-        if role not in {"user", "assistant"}:
+        if role not in {
+            "user",
+            "assistant",
+        }:
+
             continue
 
         content = (
@@ -1296,35 +1644,22 @@ def build_conversation_history(messages, max_messages=12):
             or ""
         )
 
-        if not str(content).strip():
+        if not str(
+            content
+        ).strip():
+
             continue
 
         history.append(
             {
                 "role": role,
-                "content": str(content).strip(),
+                "content": str(
+                    content
+                ).strip(),
             }
         )
 
     return history
-
-
-def get_long_term_memory_for_user(user_id):
-    """Safely load persistent memories for the authenticated user."""
-    try:
-        memories = get_user_memories(user_id)
-
-        if isinstance(memories, list):
-            return memories
-
-    except Exception as error:
-        print(
-            "LONG-TERM MEMORY LOAD ERROR:",
-            repr(error),
-        )
-        traceback.print_exc()
-
-    return []
 
 
 # ============================================================
@@ -1400,37 +1735,60 @@ async def chat(
     # ========================================================
     # RESOLVE SELECTED LIBRARY DOCUMENT
     # ========================================================
-    # document_id is the SQLite documents.id sent by the frontend.
-    # Pinecone uses the separate documents.document_id value, so
-    # resolve it here before calling the RAG layer.
+    #
+    # document_id from frontend:
+    #     SQLite documents.id
+    #
+    # document_id used by Pinecone:
+    #     documents.document_id
+    #
+    # We resolve the user's selected Library document here.
+    #
+    # ========================================================
+
     selected_rag_document_id = None
+    selected_database_document_id = document_id
 
     if document_id is not None:
+
         selected_document = get_document(
             document_id,
             user_id,
         )
 
         if not selected_document:
+
             raise HTTPException(
                 status_code=404,
                 detail="Selected document not found.",
             )
 
-        if selected_document.get("file_type") != "pdf":
+        if selected_document.get(
+            "file_type"
+        ) != "pdf":
+
             raise HTTPException(
                 status_code=400,
-                detail="Only PDF documents can be used for drug questions.",
+                detail=(
+                    "Only PDF documents can be "
+                    "used for drug questions."
+                ),
             )
 
-        selected_rag_document_id = selected_document.get(
-            "document_id"
+        selected_rag_document_id = (
+            selected_document.get(
+                "document_id"
+            )
         )
 
         if not selected_rag_document_id:
+
             raise HTTPException(
                 status_code=500,
-                detail="Selected document is missing its RAG document ID.",
+                detail=(
+                    "Selected document is missing "
+                    "its RAG document ID."
+                ),
             )
 
     # ========================================================
@@ -1504,6 +1862,18 @@ async def chat(
                     )
 
                     # ------------------------------------------
+                    # VALIDATE PDF
+                    # ------------------------------------------
+
+                    validate_pdf_content(
+                        file_path
+                    )
+
+                    print(
+                        "PDF VALIDATION: PASSED"
+                    )
+
+                    # ------------------------------------------
                     # INDEX PDF
                     # ------------------------------------------
 
@@ -1522,26 +1892,39 @@ async def chat(
                     # SAVE LIBRARY RECORD
                     # ------------------------------------------
 
-                    database_document_id = save_pdf_document(
-                        user_id,
-                        filename,
-                        file_path,
-                        stored_filename,
-                        upload_result,
+                    database_document_id = (
+                        save_pdf_document(
+                            user_id,
+                            filename,
+                            file_path,
+                            stored_filename,
+                            upload_result,
+                        )
                     )
 
-                    # If the PDF was attached directly to this chat request,
-                    # use its Pinecone document ID for this question.
-                    selected_rag_document_id = upload_result.get(
-                        "document_id"
-                    ) or selected_rag_document_id
+                    # ------------------------------------------
+                    # IMPORTANT:
+                    # Current attached PDF becomes the selected
+                    # RAG document for THIS question.
+                    # ------------------------------------------
+
+                    selected_rag_document_id = (
+                        upload_result.get(
+                            "document_id"
+                        )
+                        or selected_rag_document_id
+                    )
+
+                    selected_database_document_id = database_document_id
 
                     processed_files.append(
                         {
                             "filename": filename,
                             "type": "pdf",
                             "status": "indexed",
-                            "document_id": database_document_id,
+                            "document_id": (
+                                database_document_id
+                            ),
                             "drug": upload_result.get(
                                 "drug"
                             ),
@@ -1561,6 +1944,35 @@ async def chat(
                         "PDF indexed successfully."
                     )
                     print("=" * 70)
+
+                except ValueError as error:
+
+                    print(
+                        "CHAT PDF REJECTED:",
+                        repr(error),
+                    )
+
+                    if os.path.exists(
+                        file_path
+                    ):
+
+                        try:
+
+                            os.remove(
+                                file_path
+                            )
+
+                        except Exception:
+
+                            pass
+
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"PDF '{filename}' rejected: "
+                            f"{str(error)}"
+                        ),
+                    )
 
                 except Exception as error:
 
@@ -1673,11 +2085,13 @@ async def chat(
                     # SAVE IMAGE TO LIBRARY
                     # ------------------------------------------
 
-                    document_id = save_image_document(
-                        user_id,
-                        filename,
-                        file_path,
-                        stored_filename,
+                    image_document_id = (
+                        save_image_document(
+                            user_id,
+                            filename,
+                            file_path,
+                            stored_filename,
+                        )
                     )
 
                     processed_files.append(
@@ -1689,7 +2103,9 @@ async def chat(
                                 if image_observation
                                 else "analysis_failed"
                             ),
-                            "document_id": document_id,
+                            "document_id": (
+                                image_document_id
+                            ),
                             "analysis": (
                                 image_observation
                                 or ""
@@ -1764,15 +2180,7 @@ async def chat(
     )
 
     # ========================================================
-    # RECOVER PREVIOUS VIDEOS
-    # ========================================================
-
-    previous_videos = get_previous_videos(
-        previous_messages
-    )
-
-    # ========================================================
-    # RECOVER PREVIOUS IMAGE
+    # GET PREVIOUS IMAGE CONTEXT
     # ========================================================
 
     previous_image_context = ""
@@ -1834,7 +2242,7 @@ async def chat(
         )
 
     # ========================================================
-    # FILE ONLY REQUEST
+    # FILE-ONLY REQUEST
     # ========================================================
 
     if not question:
@@ -1850,8 +2258,9 @@ async def chat(
         else:
 
             answer = (
-                "Your file has been received. "
-                "Please ask a question about it."
+                "Your PDF has been uploaded and indexed. "
+                "Please ask a question about the "
+                "information in the document."
             )
 
         add_message(
@@ -1921,6 +2330,11 @@ async def chat(
             len(previous_messages),
         )
 
+        print(
+            "SELECTED RAG DOCUMENT:",
+            selected_rag_document_id,
+        )
+
         if effective_image_context:
 
             print(
@@ -1936,26 +2350,14 @@ async def chat(
         print("=" * 70)
 
         # ----------------------------------------------------
-        # CALL RAG
+        # SHORT-TERM CONVERSATION HISTORY
         # ----------------------------------------------------
 
-        # ----------------------------------------------------
-        # CONVERSATION MEMORY
-        # ----------------------------------------------------
-        # previous_messages was loaded BEFORE the current user
-        # message was saved, so it contains only the earlier
-        # conversation. This is exactly what the LLM needs as
-        # short-term conversation context.
-        conversation_history = build_conversation_history(
-            previous_messages,
-            max_messages=12,
-        )
-
-        # Persistent memory belongs to the authenticated user,
-        # not to one particular chat. Therefore memories survive
-        # new chats and future sessions.
-        long_term_memories = get_long_term_memory_for_user(
-            user_id
+        conversation_history = (
+            build_conversation_history(
+                previous_messages,
+                max_messages=12,
+            )
         )
 
         print(
@@ -1963,17 +2365,25 @@ async def chat(
             len(conversation_history),
         )
 
-        print(
-            "LONG-TERM MEMORIES:",
-            len(long_term_memories),
-        )
+        # ----------------------------------------------------
+        # NO LONG-TERM MEMORY
+        # ----------------------------------------------------
+        #
+        # memories=[] intentionally.
+        #
+        # DrugAssist does NOT store:
+        #   - user names
+        #   - personal preferences
+        #   - personal facts
+        #   - cross-chat memories
+        #
+        # ----------------------------------------------------
 
         result = answer_question(
             question,
-            previous_videos=previous_videos,
             image_context=effective_image_context,
             conversation_history=conversation_history,
-            memories=long_term_memories,
+            memories=[],
             user_id=user_id,
             chat_id=current_chat_id,
             document_id=selected_rag_document_id,
@@ -1986,9 +2396,9 @@ async def chat(
 
             result = {}
 
-        # ----------------------------------------------------
+        # ====================================================
         # RESPONSE DATA
-        # ----------------------------------------------------
+        # ====================================================
 
         answer = result.get(
             "answer",
@@ -2000,10 +2410,44 @@ async def chat(
             [],
         )
 
-        videos = result.get(
-            "videos",
-            [],
-        )
+        
+        # ----------------------------------------------------
+        # ENRICH SOURCES FOR CLICKABLE PDF CITATIONS
+        # ----------------------------------------------------
+        enriched_sources = []
+
+        for source in sources if isinstance(sources, list) else []:
+            if not isinstance(source, dict):
+                continue
+
+            item = dict(source)
+
+            if selected_database_document_id is not None:
+                item["database_document_id"] = (
+                    selected_database_document_id
+                )
+
+            item["filename"] = (
+                item.get("filename")
+                or item.get("source")
+                or "Source document"
+            )
+
+            item["page"] = (
+                item.get("page")
+                or item.get("page_number")
+                or item.get("pageNumber")
+            )
+
+            enriched_sources.append(item)
+
+        sources = enriched_sources
+
+# ----------------------------------------------------
+        # YouTube intentionally disabled
+        # ----------------------------------------------------
+
+        videos = []
 
         confidence = result.get(
             "confidence",
@@ -2014,27 +2458,33 @@ async def chat(
             },
         )
 
-        grounding_score = result.get(
-            "grounding_score",
-            confidence.get(
+        if isinstance(
+            confidence,
+            dict,
+        ):
+
+            grounding_score = result.get(
                 "grounding_score",
-                0.0,
+                confidence.get(
+                    "grounding_score",
+                    0.0,
+                ),
             )
-            if isinstance(
-                confidence,
-                dict,
-            )
-            else 0.0,
-        )
+
+        else:
+
+            grounding_score = 0.0
 
         evidence = result.get(
             "evidence",
             [],
         )
 
-        returned_image_analysis = result.get(
-            "image_analysis",
-            effective_image_context,
+        returned_image_analysis = (
+            result.get(
+                "image_analysis",
+                effective_image_context,
+            )
         )
 
         if not answer:
@@ -2042,50 +2492,6 @@ async def chat(
             answer = (
                 "I couldn't generate an answer "
                 "from the available evidence."
-            )
-
-        # ====================================================
-        # SAVE DURABLE USER MEMORY
-        # ====================================================
-        # rag.py normally performs this automatically. We repeat the
-        # simple memory extraction here only as a defensive layer so
-        # explicit statements such as "my name is Deekshitha" are
-        # persisted even if a future RAG path changes.
-        try:
-            memory_match = None
-
-            import re as _memory_re
-
-            memory_match = _memory_re.search(
-                r"\\bmy name is\\s+([A-Za-z][A-Za-z .'-]{1,60})",
-                question,
-                _memory_re.IGNORECASE,
-            )
-
-            if memory_match:
-                memory_name = memory_match.group(1).strip(
-                    " .,!?"
-                )
-
-                if memory_name:
-                    upsert_memory(
-                        user_id,
-                        "name",
-                        memory_name,
-                        "personal",
-                        1.0,
-                    )
-
-                    print(
-                        "LONG-TERM MEMORY SAVED:",
-                        "name =",
-                        memory_name,
-                    )
-
-        except Exception as memory_error:
-            print(
-                "LONG-TERM MEMORY SAVE ERROR:",
-                repr(memory_error),
             )
 
         # ====================================================
@@ -2099,7 +2505,7 @@ async def chat(
                 role="assistant",
                 content=answer,
                 sources=sources,
-                videos=videos,
+                videos=[],
                 evidence=evidence,
                 confidence=confidence,
                 grounding_score=grounding_score,
@@ -2119,7 +2525,7 @@ async def chat(
                 role="assistant",
                 content=answer,
                 sources=sources,
-                videos=videos,
+                videos=[],
             )
 
         # ====================================================
@@ -2135,18 +2541,22 @@ async def chat(
         print(
             "ANSWER GENERATED SUCCESSFULLY."
         )
+
         print(
             "SOURCES:",
             len(sources),
         )
+
         print(
             "VIDEOS:",
-            len(videos),
+            0,
         )
+
         print(
             "GROUNDING SCORE:",
             grounding_score,
         )
+
         print("=" * 70)
 
         # ====================================================
@@ -2162,7 +2572,7 @@ async def chat(
             "question": question,
             "answer": answer,
             "sources": sources,
-            "videos": videos,
+            "videos": [],
             "files": processed_files,
             "confidence": confidence,
             "grounding_score": grounding_score,
@@ -2183,6 +2593,7 @@ async def chat(
         print("=" * 70)
         print("CHAT ERROR")
         print("=" * 70)
+
         print(
             repr(error)
         )
@@ -2199,3 +2610,47 @@ async def chat(
                 + str(error)
             ),
         )
+
+# ============================================================
+# OPEN PDF — AUTHENTICATED SOURCE VIEWER
+# ============================================================
+
+@app.get("/documents/{document_id}/pdf")
+def open_document_pdf(
+    document_id: int,
+    current_user=Depends(get_current_user),
+):
+    """Return an uploaded PDF only to its owning authenticated user."""
+    user_id = current_user["id"]
+
+    document = get_document(
+        document_id,
+        user_id,
+    )
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found.",
+        )
+
+    if str(document.get("file_type") or "").lower() != "pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF documents can be opened here.",
+        )
+
+    file_path = document.get("file_path")
+
+    if not file_path or not os.path.isfile(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="PDF file is not available.",
+        )
+
+    return FileResponse(
+        path=file_path,
+        media_type="application/pdf",
+        filename=document.get("filename") or "document.pdf",
+        content_disposition_type="inline",
+    )
