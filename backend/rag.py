@@ -530,13 +530,15 @@ def is_drug_medical_question(question: str) -> bool:
         "pharmacology", "treatment", "treat", "used for",
         "uses", "indicated", "how does", "mechanism",
         "composition", "formulation", "formulations", "available forms", "active ingredient", "ingredient",
-        "administration", "storage", "pregnancy", "lactation",
+        "administration", "route", "oral", "monitoring", "monitor", "laboratory", "lab",
+        "blood test", "tests", "storage", "pregnancy", "lactation",
         "generic name", "drug class", "drug type", "class of drug",
         "jak", "janus kinase", "stat", "cytokine", "phosphorylation",
         "serious risk", "serious risks", "boxed warning", "black box",
         "safe", "can i", "should i", "can my", "should my",
         "child", "daughter", "son", "pediatric", "paediatric",
         "age", "years old", "kg", "weight", "milligram", "mg",
+        "patient population", "patient populations", "intended for", "who can use", "who is it for",
         "kidney", "renal", "liver", "hepatic", "breastfeed",
         "rheumatoid arthritis", "psoriatic arthritis", "atopic dermatitis",
         "ulcerative colitis", "crohn", "ankylosing spondylitis",
@@ -724,6 +726,12 @@ def classify_question(question: str) -> str:
     if any(x in q for x in ["dose", "dosage", "dosing", "mg", "milligram", "how much"]):
         return "DOSAGE"
 
+    if any(x in q for x in [
+        "monitoring", "monitor", "what tests", "which tests",
+        "blood test", "laboratory", "lab test", "check while using"
+    ]):
+        return "MONITORING"
+
     if any(x in q for x in ["used for", "uses", "indication", "indications", "treat", "treatment", "condition"]):
         return "INDICATIONS"
 
@@ -772,50 +780,90 @@ def get_intent_retrieval_terms(intent: str, question: str) -> str:
         "PREGNANCY_LACTATION": "pregnancy lactation breastfeeding reproductive potential",
         "RENAL": "renal impairment kidney function dose adjustment",
         "HEPATIC": "hepatic impairment liver function dose adjustment",
+        "MONITORING": "monitoring laboratory tests blood tests clinical monitoring safety parameters",
         "GENERAL_DRUG": "prescribing information drug information clinical pharmacology",
     }
 
     return f"{intent_terms.get(intent, intent_terms['GENERAL_DRUG'])} {' '.join(qualifiers)}".strip()
 
 
-def get_targeted_retrieval_queries(intent: str, question: str) -> List[str]:
-    """Return generic semantic queries for the requested information area.
+def get_targeted_retrieval_queries(
+    intent: str,
+    question: str
+) -> List[str]:
+    """Return document-neutral semantic queries for the requested evidence.
 
-    No drug name, dose, indication, or other medical fact is hardcoded here.
-    Any such facts must come from the selected PDF itself.
+    These queries deliberately avoid hardcoded drug facts. They expand the
+    user's wording only with generic evidence-category language so that
+    paraphrased questions can reach the relevant prescribing-information
+    section.
     """
     q = (question or "").strip()
     terms = get_intent_retrieval_terms(intent, q)
 
     queries = [
+        q,
         f"{q} {terms}",
         f"{terms} {q}",
     ]
 
-    # A section-heading style query helps when the exact user wording differs
-    # substantially from the wording used in the prescribing information.
     section_queries = {
-        "IDENTITY": "description product name prescribing information highlights",
-        "FORMULATIONS": "dosage forms formulations available forms strengths route of administration",
+        "IDENTITY": "drug description product identity active ingredient brand generic",
+        "FORMULATIONS": "dosage forms formulation route of administration available forms strengths",
         "GENERIC_NAME": "product name generic name active ingredient",
-        "ACTIVE_INGREDIENT": "description active ingredient composition",
+        "ACTIVE_INGREDIENT": "description active ingredient active substance composition",
         "DRUG_CLASS": "pharmacologic class therapeutic class drug class",
-        "MECHANISM": "mechanism of action clinical pharmacology pharmacodynamics",
-        "INDICATIONS": "indications and usage indicated for limitations of use",
-        "DOSAGE": "dosage and administration recommended dosage dose dosing",
-        "WARNINGS": "warnings and precautions boxed warning",
-        "ADVERSE_REACTIONS": "adverse reactions clinical trials experience postmarketing",
-        "CONTRAINDICATIONS": "contraindications",
-        "INTERACTIONS": "drug interactions",
-        "PREGNANCY_LACTATION": "use in specific populations pregnancy lactation",
-        "RENAL": "renal impairment dosage adjustment",
-        "HEPATIC": "hepatic impairment dosage adjustment",
-        "GENERAL_DRUG": "prescribing information description indications warnings adverse reactions",
+        "MECHANISM": "mechanism of action clinical pharmacology pharmacodynamics target pathway",
+        "INDICATIONS": "indications and usage indicated for conditions limitations of use",
+        "DOSAGE": "dosage and administration recommended dosage dose frequency duration age weight indication",
+        "WARNINGS": "warnings and precautions boxed warning serious risks safety",
+        "ADVERSE_REACTIONS": "adverse reactions side effects clinical trials postmarketing",
+        "CONTRAINDICATIONS": "contraindications contraindicated hypersensitivity",
+        "INTERACTIONS": "drug interactions concomitant medicines interaction effects",
+        "PREGNANCY_LACTATION": "use in specific populations pregnancy lactation breastfeeding reproductive potential",
+        "RENAL": "renal impairment kidney function renal dose adjustment",
+        "HEPATIC": "hepatic impairment liver function hepatic dose adjustment",
+        "MONITORING": "monitoring laboratory tests blood tests clinical monitoring safety parameters",
+        "GENERAL_DRUG": "prescribing information description indications warnings adverse reactions clinical pharmacology",
     }
-    queries.append(f"{section_queries.get(intent, section_queries['GENERAL_DRUG'])} {q}")
 
-    return list(dict.fromkeys(query.strip() for query in queries if query.strip()))
+    section_query = section_queries.get(
+        intent,
+        section_queries["GENERAL_DRUG"]
+    )
+    queries.append(f"{section_query} {q}")
+    queries.append(section_query)
 
+    # When a user asks a multi-part question, retrieve each meaningful part
+    # independently as well as the complete question. This prevents one
+    # strongly matching clause from hiding evidence for another clause.
+    clauses = re.split(
+        r"\s*(?:\band\b|\balso\b|\bas well as\b|[;?])\s*",
+        q,
+        flags=re.IGNORECASE
+    )
+
+    for clause in clauses:
+        clause = clause.strip(" .,!?:;")
+        if len(clause) >= 8 and clause.lower() != q.lower():
+            queries.append(clause)
+            queries.append(f"{clause} {section_query}")
+
+    # For individualized questions, retrieve the label facts using a
+    # neutral evidence query as well. The safety boundary is applied later;
+    # this query must never become a personalized recommendation.
+    if intent == "DOSAGE" and is_clinical_decision_question(q):
+        queries.extend([
+            "recommended dosage administration age weight indication",
+            "pediatric recommended dosage age weight administration",
+            "dose adjustment criteria prescribing information",
+        ])
+
+    return list(dict.fromkeys(
+        query.strip()
+        for query in queries
+        if query and query.strip()
+    ))
 
 # ============================================================
 # CONVERSATION HISTORY
@@ -1100,6 +1148,17 @@ def rerank_matches_for_intent(
                 if "kg" in text or "weight" in text:
                     bonus += 0.15
 
+        elif intent == "MONITORING":
+            if any(term in overview_section for term in [
+                "monitoring", "laboratory", "laboratory tests",
+                "blood tests", "monitor"
+            ]):
+                bonus += 0.55
+            if "warnings and precautions" in overview_section:
+                bonus += 0.20
+            if "dosage and administration" in overview_section:
+                bonus -= 0.20
+
         elif intent == "DRUG_CLASS":
             if "jak inhibitor" in text or "janus kinase" in text:
                 bonus += 0.40
@@ -1109,7 +1168,7 @@ def rerank_matches_for_intent(
                 bonus += 0.75
             if "12.1" in section:
                 bonus += 0.35
-            if any(term in combined for term in [
+            if any(term in f"{section} {text}" for term in [
                 "molecular target", "signaling", "pathway",
                 "phosphorylation", "receptor", "enzyme"
             ]):
@@ -1125,7 +1184,7 @@ def rerank_matches_for_intent(
                 bonus += 0.80
 
         elif intent == "GENERIC_NAME" or intent == "ACTIVE_INGREDIENT":
-            if any(term in combined for term in [
+            if any(term in f"{section} {text}" for term in [
                 "generic name", "active ingredient", "active substance",
                 "description", "highlights"
             ]):
@@ -1173,9 +1232,11 @@ def retrieve_documents(
     )
 
     intent = classify_question(question)
-    intent_terms = get_intent_retrieval_terms(intent, question)
 
-    retrieval_question = f"{question}\n{intent_terms}"
+    # Keep the user's exact wording as the primary semantic signal. Generic
+    # intent terms are additional retrieval hints, not a replacement for the
+    # actual question.
+    retrieval_question = question
 
     if image_text:
         retrieval_question = (
@@ -1233,11 +1294,8 @@ def retrieve_documents(
         retrieval_question
     )
 
-    # Add an intent-focused query to improve section-level retrieval.
-    intent_query = get_intent_retrieval_terms(intent, question)
-    if intent_query and intent_query not in queries:
-        queries.append(intent_query)
-
+    # Add neutral semantic expansions. The original question remains the
+    # highest-priority query; these only help with different wording.
     for targeted_query in get_targeted_retrieval_queries(intent, question):
         if targeted_query and targeted_query not in queries:
             queries.append(targeted_query)
@@ -1705,6 +1763,25 @@ def _question_keywords(
 ) -> List[str]:
 
     q = (question or "").lower()
+
+    if any(
+        word in q
+        for word in [
+            "monitoring",
+            "monitor",
+            "what tests",
+            "blood test",
+            "laboratory",
+        ]
+    ):
+        return [
+            "monitoring",
+            "laboratory",
+            "laboratory tests",
+            "blood tests",
+            "monitor",
+            "test",
+        ]
 
     if any(
         word in q
@@ -2319,10 +2396,31 @@ def answer_question(
         "write a joke", "sing me a song"
     }
 
-    if (
-        not is_drug_medical_question(question)
-        and not document_context_question
-    ) or normalized_q in casual_or_unrelated:
+    if normalized_q in casual_or_unrelated:
+        return {
+            "success": True,
+            "question": question,
+            "answer": (
+                "I’m DrugAssist, focused on drug and medication "
+                "information from the trusted documents you provide. "
+                "Please ask a question about the selected document."
+            ),
+            "sources": [],
+            "videos": [],
+            "image_analysis": "",
+            "confidence": {
+                "label": "not_applicable",
+                "score": 0.0,
+                "grounding_score": 0.0
+            },
+            "grounding_score": 0.0
+        }
+
+    # If a PDF is selected, do not reject the question using a keyword list.
+    # Retrieval decides whether the selected document contains relevant
+    # evidence. Without a selected PDF, retain the normal DrugAssist scope
+    # gate.
+    if not document_context_question and not is_drug_medical_question(question):
         return {
             "success": True,
             "question": question,
