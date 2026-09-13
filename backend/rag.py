@@ -34,15 +34,15 @@ FALLBACK_MODEL = os.getenv(
 )
 
 RETRIEVAL_K = int(
-    os.getenv("RAG_RETRIEVAL_K", "8")
+    os.getenv("RAG_RETRIEVAL_K", "12")
 )
 
 CONTEXT_K = int(
-    os.getenv("RAG_CONTEXT_K", "6")
+    os.getenv("RAG_CONTEXT_K", "10")
 )
 
 MIN_SCORE = float(
-    os.getenv("RAG_MIN_SCORE", "0.20")
+    os.getenv("RAG_MIN_SCORE", "0.15")
 )
 
 MAX_CHUNK_CHARS = int(
@@ -247,9 +247,13 @@ def build_query_variations(question: str) -> List[str]:
     if not question:
         return []
 
+    # Keep the user's original wording as the primary semantic query.
+    # The second query adds document context without inventing drug-specific
+    # terminology. Pinecone performs the semantic matching.
     return [
         question,
-        f"prescribing information {question}"
+        f"prescribing information {question}",
+        f"medical information {question}"
     ]
 
 
@@ -673,8 +677,7 @@ def classify_question(question: str) -> str:
 
     if any(x in q for x in [
         "brand name", "trade name", "brand or generic",
-        "medicine name", "medication name", "is it a brand",
-        "is rinvoq a brand", "what is rinvoq", "tell me about rinvoq"
+        "medicine name", "medication name", "is it a brand"
     ]):
         return "IDENTITY"
 
@@ -731,182 +734,87 @@ def classify_question(question: str) -> str:
 
 
 def get_intent_retrieval_terms(intent: str, question: str) -> str:
-    """Build generic section-focused retrieval terms for the selected drug PDF."""
+    """Build generic semantic retrieval terms without hardcoding any drug.
+
+    The selected document is the authority. These terms only describe the
+    information category being requested; they never inject facts or doses.
+    """
     q = (question or "").lower()
 
-    condition_terms = []
-    conditions = [
-        "rheumatoid arthritis", "psoriatic arthritis", "atopic dermatitis",
-        "ulcerative colitis", "crohn's disease", "crohn disease",
-        "ankylosing spondylitis", "non-radiographic axial spondyloarthritis",
-        "polyarticular juvenile idiopathic arthritis", "juvenile idiopathic arthritis",
-        "giant cell arteritis",
+    # Preserve explicit conditions/qualifiers that actually appear in the
+    # user's question. This helps retrieve the correct part of the PDF.
+    qualifiers = []
+    qualifier_patterns = [
+        r"\b\d{1,3}\s*(?:years?|yrs?)\s*(?:old)?\b",
+        r"\b\d+(?:\.\d+)?\s*kg\b",
+        r"\b\d+(?:\.\d+)?\s*(?:mg|mcg|g)\b",
+        r"\b(?:adult|adults|child|children|pediatric|paediatric|adolescent|elderly|older adults?)\b",
+        r"\b(?:pregnan(?:t|cy)|lactat(?:e|ion)|breastfeed(?:ing)?)\b",
+        r"\b(?:kidney|renal|liver|hepatic)\b",
+        r"\b(?:rheumatoid arthritis|psoriatic arthritis|atopic dermatitis|ulcerative colitis|crohn(?:'s)? disease|ankylosing spondylitis)\b",
     ]
-    for condition in conditions:
-        if condition in q:
-            condition_terms.append(condition)
+    for pattern in qualifier_patterns:
+        qualifiers.extend(re.findall(pattern, q, re.IGNORECASE))
 
     intent_terms = {
-        "IDENTITY": "prescribing information highlights description drug name generic name",
-        "FORMULATIONS": "RINVOQ dosage forms formulation extended-release tablets oral solution RINVOQ LQ",
-        "GENERIC_NAME": "highlights prescribing information drug name generic name active ingredient",
-        "ACTIVE_INGREDIENT": "description active ingredient upadacitinib formulation",
-        "DRUG_CLASS": "indications and usage drug class JAK inhibitor Janus kinase",
-        "MECHANISM": "12.1 Mechanism of Action clinical pharmacology Janus kinase JAK STAT cytokine signaling",
-        "INDICATIONS": "1 INDICATIONS AND USAGE indicated treatment limitations of use",
-        "DOSAGE": "2 DOSAGE AND ADMINISTRATION recommended dosage dose dosing induction maintenance",
-        "WARNINGS": "boxed warning 5 WARNINGS AND PRECAUTIONS serious infections mortality malignancy MACE thrombosis",
-        "ADVERSE_REACTIONS": "6 ADVERSE REACTIONS clinical trials experience postmarketing experience",
-        "CONTRAINDICATIONS": "4 CONTRAINDICATIONS known hypersensitivity",
-        "INTERACTIONS": "7 DRUG INTERACTIONS strong CYP3A4 inhibitors inducers",
-        "PREGNANCY_LACTATION": "8.1 Pregnancy 8.2 Lactation use in specific populations",
-        "RENAL": "2.12 Renal Impairment renal dosage adjustment eGFR",
-        "HEPATIC": "2.12 Hepatic Impairment hepatic dosage adjustment Child-Pugh",
-        "GENERAL_DRUG": "prescribing information drug information",
+        "IDENTITY": "drug product identity description brand generic active ingredient",
+        "FORMULATIONS": "dosage forms formulation tablet capsule solution injection route strength available forms",
+        "GENERIC_NAME": "generic name active ingredient product name",
+        "ACTIVE_INGREDIENT": "active ingredient active substance composition",
+        "DRUG_CLASS": "drug class therapeutic class pharmacologic class",
+        "MECHANISM": "mechanism of action pharmacology molecular target pathway signaling",
+        "INDICATIONS": "indications uses indicated conditions treatment limitations of use",
+        "DOSAGE": "dosage dose dosing recommended dosage administration frequency duration age weight indication",
+        "WARNINGS": "warnings precautions boxed warning serious risks safety",
+        "ADVERSE_REACTIONS": "adverse reactions side effects safety clinical trials postmarketing",
+        "CONTRAINDICATIONS": "contraindications contraindicated hypersensitivity",
+        "INTERACTIONS": "drug interactions concomitant medicines interaction effects",
+        "PREGNANCY_LACTATION": "pregnancy lactation breastfeeding reproductive potential",
+        "RENAL": "renal impairment kidney function dose adjustment",
+        "HEPATIC": "hepatic impairment liver function dose adjustment",
+        "GENERAL_DRUG": "prescribing information drug information clinical pharmacology",
     }
 
-    return f"{intent_terms.get(intent, 'prescribing information')} {' '.join(condition_terms)}".strip()
+    return f"{intent_terms.get(intent, intent_terms['GENERAL_DRUG'])} {' '.join(qualifiers)}".strip()
 
 
 def get_targeted_retrieval_queries(intent: str, question: str) -> List[str]:
-    """Return high-precision queries for the selected prescribing-information section."""
-    q = (question or "").lower()
-    queries: List[str] = []
+    """Return generic semantic queries for the requested information area.
 
-    if intent == "IDENTITY":
-        queries = [
-            "RINVOQ upadacitinib brand name active ingredient",
-            "RINVOQ Highlights of Prescribing Information description",
-        ]
+    No drug name, dose, indication, or other medical fact is hardcoded here.
+    Any such facts must come from the selected PDF itself.
+    """
+    q = (question or "").strip()
+    terms = get_intent_retrieval_terms(intent, q)
 
-    elif intent == "FORMULATIONS":
-        queries = [
-            "RINVOQ dosage forms formulation extended release tablet oral solution",
-            "RINVOQ LQ oral solution upadacitinib",
-            "RINVOQ extended-release tablets strengths",
-        ]
+    queries = [
+        f"{q} {terms}",
+        f"{terms} {q}",
+    ]
 
-    elif intent == "GENERIC_NAME":
-        queries = [
-            "RINVOQ upadacitinib generic name active ingredient",
-            "RINVOQ Highlights Description upadacitinib",
-        ]
+    # A section-heading style query helps when the exact user wording differs
+    # substantially from the wording used in the prescribing information.
+    section_queries = {
+        "IDENTITY": "description product name prescribing information highlights",
+        "FORMULATIONS": "dosage forms formulations available forms strengths route of administration",
+        "GENERIC_NAME": "product name generic name active ingredient",
+        "ACTIVE_INGREDIENT": "description active ingredient composition",
+        "DRUG_CLASS": "pharmacologic class therapeutic class drug class",
+        "MECHANISM": "mechanism of action clinical pharmacology pharmacodynamics",
+        "INDICATIONS": "indications and usage indicated for limitations of use",
+        "DOSAGE": "dosage and administration recommended dosage dose dosing",
+        "WARNINGS": "warnings and precautions boxed warning",
+        "ADVERSE_REACTIONS": "adverse reactions clinical trials experience postmarketing",
+        "CONTRAINDICATIONS": "contraindications",
+        "INTERACTIONS": "drug interactions",
+        "PREGNANCY_LACTATION": "use in specific populations pregnancy lactation",
+        "RENAL": "renal impairment dosage adjustment",
+        "HEPATIC": "hepatic impairment dosage adjustment",
+        "GENERAL_DRUG": "prescribing information description indications warnings adverse reactions",
+    }
+    queries.append(f"{section_queries.get(intent, section_queries['GENERAL_DRUG'])} {q}")
 
-    elif intent == "ACTIVE_INGREDIENT":
-        queries = [
-            "RINVOQ active ingredient upadacitinib",
-            "Description RINVOQ upadacitinib",
-        ]
-
-    elif intent == "DRUG_CLASS":
-        queries = [
-            "RINVOQ upadacitinib Janus kinase JAK inhibitor",
-            "12.1 Mechanism of Action Janus kinase JAK",
-        ]
-
-    elif intent == "MECHANISM":
-        queries = [
-            "12.1 Mechanism of Action upadacitinib",
-            "upadacitinib JAK1 JAK2 STAT phosphorylation cytokine signaling",
-        ]
-
-    elif intent == "INDICATIONS":
-        # The indication list can be split across PDF chunks. Search the
-        # section plus the explicit conditions so the actual indication
-        # chunks are recovered even if the heading is on another chunk.
-        queries = [
-            "1 INDICATIONS AND USAGE RINVOQ upadacitinib indicated",
-            "RINVOQ indicated for treatment rheumatoid arthritis psoriatic arthritis atopic dermatitis",
-            "RINVOQ indicated for ulcerative colitis Crohn's disease ankylosing spondylitis",
-            "RINVOQ indicated for non-radiographic axial spondyloarthritis polyarticular juvenile idiopathic arthritis giant cell arteritis",
-        ]
-
-    elif intent == "ADVERSE_REACTIONS":
-        queries = [
-            "6 ADVERSE REACTIONS RINVOQ",
-            "6.1 Clinical Trials Experience RINVOQ adverse reactions",
-            "RINVOQ most common adverse reactions clinical trials",
-            "RINVOQ postmarketing experience adverse reactions",
-        ]
-        if "ulcerative colitis" in q:
-            queries.append("RINVOQ ulcerative colitis adverse reactions")
-        elif "crohn" in q:
-            queries.append("RINVOQ Crohn's disease adverse reactions")
-        elif "atopic dermatitis" in q:
-            queries.append("RINVOQ atopic dermatitis adverse reactions")
-
-    elif intent == "WARNINGS":
-        queries = [
-            "Boxed Warning RINVOQ serious infections mortality malignancy MACE thrombosis",
-            "5 WARNINGS AND PRECAUTIONS RINVOQ",
-        ]
-
-    elif intent == "CONTRAINDICATIONS":
-        queries = [
-            "4 CONTRAINDICATIONS RINVOQ",
-            "RINVOQ contraindicated hypersensitivity",
-        ]
-
-    elif intent == "INTERACTIONS":
-        queries = [
-            "7 DRUG INTERACTIONS RINVOQ CYP3A4 inhibitors inducers",
-            "RINVOQ drug interactions",
-        ]
-
-    elif intent == "PREGNANCY_LACTATION":
-        queries = [
-            "8.1 Pregnancy RINVOQ",
-            "8.2 Lactation RINVOQ breast milk",
-        ]
-
-    elif intent == "RENAL":
-        queries = [
-            "RINVOQ renal impairment dosage",
-            "RINVOQ renal impairment eGFR",
-        ]
-
-    elif intent == "HEPATIC":
-        queries = [
-            "RINVOQ hepatic impairment dosage Child-Pugh",
-            "RINVOQ hepatic impairment",
-        ]
-
-    elif intent == "DOSAGE":
-        if "rheumatoid arthritis" in q:
-            queries.append("2.3 Recommended Dosage in Rheumatoid Arthritis 15 mg once daily")
-        elif "psoriatic arthritis" in q:
-            queries.append("2.4 Recommended Dosage in Psoriatic Arthritis")
-        elif "atopic dermatitis" in q:
-            queries.append("2.5 Recommended Dosage in Atopic Dermatitis 12 years 40 kg 15 mg 30 mg")
-        elif "ulcerative colitis" in q:
-            queries.append("2.6 Recommended Dosage in Ulcerative Colitis induction maintenance 15 mg 30 mg")
-        elif "crohn" in q:
-            queries += [
-                "2.7 Recommended Dosage in Crohn's Disease",
-                "Crohn disease recommended dosage induction maintenance upadacitinib",
-                "Crohn's disease 45 mg 12 weeks 15 mg 30 mg RINVOQ",
-            ]
-        elif "ankylosing spondylitis" in q:
-            queries.append("2.8 Recommended Dosage in Ankylosing Spondylitis 15 mg once daily")
-        elif "non-radiographic axial spondyloarthritis" in q:
-            queries.append("2.9 Recommended Dosage in Non-radiographic Axial Spondyloarthritis 15 mg once daily")
-        elif "juvenile idiopathic arthritis" in q or "pjia" in q:
-            queries.append("2.10 Recommended Dosage in Polyarticular Juvenile Idiopathic Arthritis pediatric weight")
-        elif "giant cell arteritis" in q:
-            queries.append("2.11 Recommended Dosage in Giant Cell Arteritis 15 mg once daily")
-        else:
-            queries += [
-                "2 DOSAGE AND ADMINISTRATION RINVOQ recommended dosage",
-                "RINVOQ recommended dose dosing administration",
-            ]
-
-    elif intent == "GENERAL_DRUG":
-        queries = [
-            "RINVOQ upadacitinib prescribing information drug description",
-            "RINVOQ Highlights of Prescribing Information",
-        ]
-
-    return queries
+    return list(dict.fromkeys(query.strip() for query in queries if query.strip()))
 
 
 # ============================================================
@@ -1083,6 +991,7 @@ def rerank_matches_for_intent(
         metadata = match.get("metadata", {}) or {}
         text = str(metadata.get("text", "") or "").lower()
         section = str(metadata.get("section", "") or "").lower()
+        overview_section = f"{section} {text}"
         base = float(match.get("score", 0) or 0)
         bonus = 0.0
 
@@ -1091,8 +1000,6 @@ def rerank_matches_for_intent(
             # information, not whichever dosage chunk happens to have the
             # highest embedding score.  Some uploaded chunks do not carry a
             # useful section label, so inspect both section metadata and text.
-            overview_section = f"{section} {text}"
-
             if any(term in overview_section for term in [
                 "highlights of prescribing information",
                 "highlights",
@@ -1202,7 +1109,10 @@ def rerank_matches_for_intent(
                 bonus += 0.75
             if "12.1" in section:
                 bonus += 0.35
-            if "janus kinase" in text or "phosphorylation" in text or "stat" in text:
+            if any(term in combined for term in [
+                "molecular target", "signaling", "pathway",
+                "phosphorylation", "receptor", "enzyme"
+            ]):
                 bonus += 0.30
             if "clinical studies" in section:
                 bonus -= 0.20
@@ -1210,17 +1120,16 @@ def rerank_matches_for_intent(
         elif intent == "FORMULATIONS":
             if any(term in overview_section for term in [
                 "formulation", "extended-release", "oral solution",
-                "rinvoq lq", "dosage forms", "available as"
+                "dosage forms", "available as", "oral solution", "extended-release"
             ]):
                 bonus += 0.80
-            if "upadacitinib" in text:
-                bonus += 0.15
 
         elif intent == "GENERIC_NAME" or intent == "ACTIVE_INGREDIENT":
-            if "upadacitinib" in text:
-                bonus += 0.35
-            if "highlights" in section or "description" in section:
-                bonus += 0.15
+            if any(term in combined for term in [
+                "generic name", "active ingredient", "active substance",
+                "description", "highlights"
+            ]):
+                bonus += 0.45
 
         elif intent == "CONTRAINDICATIONS":
             if "contraindications" in section or "contraindicated" in text:
@@ -1681,7 +1590,7 @@ Requirements:
 - Use bullets when appropriate.
 - Do not invent information.
 - If the intent is IDENTITY or GENERAL_DRUG and the user asks to "tell me more" or for an overview, give a balanced high-level summary of the drug (what it is, active ingredient, drug class/mechanism when supported, approved uses, major warnings, and important adverse reactions when supported).
-- For a question such as "what is Rinvoq", start with the product identity. If supported by the evidence, state that RINVOQ is the product/brand name and upadacitinib is its active ingredient. Do not replace this with tablet strengths or dosage information.
+- For a question asking what a medicine is, start with the product identity. State the brand/product name and active ingredient only when the supplied evidence supports them. Do not replace an identity answer with dosage information.
 - For a question asking whether a name is a brand name, medicine name, or generic name, answer that naming question directly from the supplied evidence.
 - For an overview question, do NOT turn the answer into a dosage list. Do not provide specific doses unless the user explicitly asks about dose/dosage/dosing.
 - For factual claims, cite the supporting evidence using exactly
@@ -2394,18 +2303,26 @@ def answer_question(
     # --------------------------------------------------------
     # Reject unrelated/casual requests before retrieval or LLM calls.
 
-    # When a PDF is selected, identity questions such as
-    # "What is Rinvoq?" are allowed because the answer must be
-    # grounded in that selected document.
-    document_context_question = (
-        document_id is not None
-        and (
-            is_document_question(question)
-            or classify_question(question) == "IDENTITY"
-        )
-    )
+    # When a PDF is selected, allow semantic questions even when they do not
+    # contain one of our predefined medical keywords. Pinecone retrieval and
+    # the evidence-grounded answer step decide whether the selected PDF
+    # actually supports the question. This allows natural wording such as
+    # "what happens after it enters the body?" without requiring a keyword.
+    # Explicit casual/unrelated requests are still rejected.
+    document_context_question = document_id is not None
+    normalized_q = re.sub(r"\s+", " ", question.lower()).strip()
+    casual_or_unrelated = {
+        "hi", "hey", "hello", "hii", "hiii", "hey there",
+        "good morning", "good afternoon", "good evening",
+        "how are you", "what's up", "whats up", "thanks",
+        "thank you", "bye", "goodbye", "tell me a joke",
+        "write a joke", "sing me a song"
+    }
 
-    if not is_drug_medical_question(question) and not document_context_question:
+    if (
+        not is_drug_medical_question(question)
+        and not document_context_question
+    ) or normalized_q in casual_or_unrelated:
         return {
             "success": True,
             "question": question,
